@@ -1,0 +1,23 @@
+<RCC>
+  <qresource prefix="/qml">
+    <file>qml/Main.qml</file>
+    <file>qml/components/Icon.qml</file>
+    <file>qml/components/PrimaryButton.qml</file>
+    <file>qml/components/SidebarButton.qml</file>
+    <file>qml/components/StyledTextField.qml</file>
+    <file>qml/components/StyledTextArea.qml</file>
+    <file>qml/components/StyledComboBox.qml</file>
+    <file>qml/components/StyledSpinBox.qml</file>
+    <file>qml/components/SecondaryButton.qml</file>
+    <file>qml/components/StyledCheckBox.qml</file>
+    <file>qml/components/StatusBadge.qml</file>
+    <file>qml/components/ProgressTrack.qml</file>
+    <file>qml/components/EmptyState.qml</file>
+    <file>qml/dialogs/BatchDialog.qml</file>
+    <file>qml/pages/CompletedPage.qml</file>
+    <file>qml/pages/DownloadsPage.qml</file>
+    <file>qml/pages/SettingsPage.qml</file>
+    <file>qml/theme/Theme.qml</file>
+    <file>qml/theme/qmldir</file>
+  </qresource>
+</RCC>

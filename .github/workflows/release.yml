@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -c packaging/constraints.txt -e ".[gui,dev]"
+          python -m pip install -c packaging/constraints.txt "Nuitka==4.1.1"
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          version=$(python scripts/release_tools.py version)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            python scripts/release_tools.py validate-tag "$GITHUB_REF_NAME"
+          fi
+      - name: Build standalone application
+        shell: bash
+        run: PATH="$PWD/.venv/bin:$PATH" pyside6-deploy -c pysidedeploy.spec --no-install
+      - name: Validate bundle structure
+        id: bundle
+        shell: bash
+        run: python scripts/release_tools.py validate-bundle --dist dist --system "${{ runner.os }}" >> "$GITHUB_OUTPUT"
+      - name: Smoke-test Unix bundle
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/app-cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/app-config
+          XDG_DATA_HOME: ${{ runner.temp }}/app-data
+        run: |
+          chmod +x "${{ steps.bundle.outputs.executable }}"
+          "${{ steps.bundle.outputs.executable }}" --service --help
+      - name: Smoke-test Windows bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}\app-data
+        run: '& "${{ steps.bundle.outputs.executable }}" --service --help'
+      - name: Archive macOS or Linux bundle
+        if: runner.os != 'Windows'
+        id: archive_unix
+        shell: bash
+        run: |
+          name="M3U8-Downloader-Pro-${{ steps.meta.outputs.version }}-${{ runner.os }}-${{ steps.bundle.outputs.architecture }}"
+          mkdir -p release
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            archive="$PWD/release/$name.zip"
+            ditto -c -k --sequesterRsrc --keepParent "${{ steps.bundle.outputs.bundle }}" "$archive"
+          else
+            archive="$PWD/release/$name.tar.gz"
+            tar -czf "$archive" -C "$(dirname "${{ steps.bundle.outputs.bundle }}")" "$(basename "${{ steps.bundle.outputs.bundle }}")"
+          fi
+          python -c 'import hashlib, pathlib, sys; p=pathlib.Path(sys.argv[1]); p.with_name(p.name+".sha256").write_text(hashlib.sha256(p.read_bytes()).hexdigest()+"  "+p.name+"\n", encoding="utf-8")' "$archive"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+      - name: Archive Windows bundle
+        if: runner.os == 'Windows'
+        id: archive_windows
+        shell: pwsh
+        run: |
+          $name = "M3U8-Downloader-Pro-${{ steps.meta.outputs.version }}-${{ runner.os }}-${{ steps.bundle.outputs.architecture }}"
+          New-Item -ItemType Directory -Force release | Out-Null
+          $archive = Join-Path $PWD "release/$name.zip"
+          Compress-Archive -Path "${{ steps.bundle.outputs.bundle }}" -DestinationPath $archive -CompressionLevel Optimal
+          $digest = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$digest  $name.zip" | Set-Content -Encoding utf8 "$archive.sha256"
+          "path=$archive" >> $env:GITHUB_OUTPUT
+      - name: Upload packaged application
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: M3U8-Downloader-Pro-${{ steps.meta.outputs.version }}-${{ runner.os }}-${{ steps.bundle.outputs.architecture }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release asset set
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          root = Path("release-assets")
+          archives = sorted(path for path in root.iterdir() if path.name.endswith((".zip", ".tar.gz")))
+          if len(archives) != 3:
+              raise SystemExit(f"expected 3 archives, found {len(archives)}")
+          for archive in archives:
+              checksum = archive.with_name(archive.name + ".sha256")
+              if not checksum.is_file():
+                  raise SystemExit(f"missing checksum: {checksum.name}")
+              expected = checksum.read_text(encoding="utf-8-sig").split()[0]
+              actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"sha256 mismatch: {archive.name}")
+          unexpected = [path.name for path in root.iterdir() if not path.name.endswith((".zip", ".tar.gz", ".sha256"))]
+          if unexpected:
+              raise SystemExit(f"unexpected release assets: {unexpected}")
+          PY
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "M3U8 Downloader Pro $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
