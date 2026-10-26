@@ -36,7 +36,7 @@ header_search_paths =
 [nuitka]
 macos.permissions = 
 mode = standalone
-extra_args = --quiet --assume-yes-for-downloads --noinclude-qt-translations --include-package=m3u8_downloader --include-package-data=m3u8_downloader.gui --include-package=qtawesome --nofollow-import-to=qtawesome.tests --noinclude-dlls=*/qml/QtQml/StateMachine/*
+extra_args = --quiet --assume-yes-for-downloads --disable-cache=ccache --noinclude-qt-translations --include-package=m3u8_downloader --include-package-data=m3u8_downloader.gui --include-package=qtawesome --nofollow-import-to=qtawesome.tests --noinclude-dlls=*/qml/QtQml/StateMachine/*
 
 [buildozer]
 mode = debug

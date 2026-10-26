@@ -123,6 +123,7 @@ def test_release_artifact_names_include_version_os_and_actual_architecture() -> 
     assert upload_steps[0]["with"]["path"] == "release/*"
     deploy_spec = (ROOT / "pysidedeploy.spec").read_text(encoding="utf-8")
     assert "--assume-yes-for-downloads" in deploy_spec
+    assert "--disable-cache=ccache" in deploy_spec
 
 
 def test_dependabot_updates_python_and_actions_weekly() -> None:
