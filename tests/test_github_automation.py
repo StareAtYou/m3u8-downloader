@@ -93,9 +93,13 @@ def test_release_builds_all_platforms_and_only_tags_publish() -> None:
     assert "gh release view" in commands and "||" in commands
     build_steps = build["steps"]
     assert any(
-        step.get("if") == "runner.os == 'Linux'" and "apt-get install -y libegl1" in str(step.get("run", ""))
+        step.get("if") == "runner.os == 'Linux'"
+        and "apt-get install -y libegl1" in str(step.get("run", ""))
+        and "python -m pip install -c packaging/constraints.txt patchelf" in str(step.get("run", ""))
         for step in build_steps
     )
+    constraints = (ROOT / "packaging" / "constraints.txt").read_text(encoding="utf-8").splitlines()
+    assert "patchelf==0.19.1.0" in constraints
     assert any(step.get("if") == "runner.os == 'Windows'" and step.get("shell") == "pwsh" for step in build_steps)
     assert any(step.get("if") == "runner.os != 'Windows'" and step.get("shell") == "bash" for step in build_steps)
     unix_archive = next(step for step in build_steps if step.get("id") == "archive_unix")

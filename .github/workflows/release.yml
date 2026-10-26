@@ -38,6 +38,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1
+          python -m pip install -c packaging/constraints.txt patchelf
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
