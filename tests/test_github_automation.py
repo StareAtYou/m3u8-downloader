@@ -45,6 +45,7 @@ def test_ci_matrix_permissions_and_quality_commands() -> None:
     assert quality["name"] == "quality (${{ matrix.python-version }})"
     assert quality["env"]["QT_QPA_PLATFORM"] == "offscreen"
     commands = _run_scripts(ci)
+    assert "apt-get install -y libegl1" in commands
     assert 'pip install -e ".[gui,dev]"' in commands
     assert "ruff check src tests scripts server.py client.py" in commands
     assert "ruff format --check src tests scripts server.py client.py" in commands
@@ -91,6 +92,10 @@ def test_release_builds_all_platforms_and_only_tags_publish() -> None:
         assert required in commands
     assert "gh release view" in commands and "||" in commands
     build_steps = build["steps"]
+    assert any(
+        step.get("if") == "runner.os == 'Linux'" and "apt-get install -y libegl1" in str(step.get("run", ""))
+        for step in build_steps
+    )
     assert any(step.get("if") == "runner.os == 'Windows'" and step.get("shell") == "pwsh" for step in build_steps)
     assert any(step.get("if") == "runner.os != 'Windows'" and step.get("shell") == "bash" for step in build_steps)
     unix_archive = next(step for step in build_steps if step.get("id") == "archive_unix")
