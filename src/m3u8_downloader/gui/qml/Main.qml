@@ -297,6 +297,7 @@ ApplicationWindow {
         function onRequestSucceeded(action, result) {
             if (action === "submit") {
                 urlInput.text = ""
+                taskNameInput.text = ""
                 overwriteCheck.checked = false
             } else if (action === "submit_batch") {
                 batchDialog.close()

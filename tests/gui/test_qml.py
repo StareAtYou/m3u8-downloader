@@ -53,6 +53,37 @@ def test_main_qml_loads_offscreen_without_warnings_and_has_exact_composer_copy(q
     del engine
 
 
+def test_single_submit_success_clears_transient_fields_and_failure_preserves_them(qtbot) -> None:
+    engine, root, bridge, warnings = load_qml(qtbot)
+    try:
+        assert warnings == []
+        url_input = named(root, "urlInput")
+        task_name = named(root, "taskNameInput")
+        save_input = named(root, "saveInput")
+        overwrite = named(root, "overwriteCheck")
+        url_input.setProperty("text", "https://cdn.example.com/episode.m3u8")
+        task_name.setProperty("text", "第 12 集")
+        save_input.setProperty("text", "/tmp/连续剧")
+        overwrite.setProperty("checked", True)
+
+        bridge.requestFailed.emit("submit", "网络错误")
+        qtbot.wait(20)
+        assert url_input.property("text") == "https://cdn.example.com/episode.m3u8"
+        assert task_name.property("text") == "第 12 集"
+        assert save_input.property("text") == "/tmp/连续剧"
+        assert overwrite.property("checked") is True
+
+        bridge.requestSucceeded.emit("submit", {"tasks": []})
+        qtbot.wait(20)
+        assert url_input.property("text") == ""
+        assert task_name.property("text") == ""
+        assert save_input.property("text") == "/tmp/连续剧"
+        assert overwrite.property("checked") is False
+    finally:
+        bridge.close()
+        del engine
+
+
 def test_table_contract_responsive_columns_controls_and_navigation(qtbot) -> None:
     engine, root, bridge, _ = load_qml(qtbot)
     assert root.findChild(object, "downloadsPage") is not None
