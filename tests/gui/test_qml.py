@@ -475,6 +475,33 @@ def test_detail_selection_model_reset_and_network_tab_refresh_all_content(qtbot)
     del engine
 
 
+def test_active_task_refresh_preserves_task_list_scroll_and_selection(qtbot) -> None:
+    tasks = many_tasks()
+    engine, root, bridge, warnings = load_qml(qtbot, tasks=tasks)
+    try:
+        assert warnings == []
+        table = named(root, "taskTable")
+        table.setProperty("currentIndex", 12)
+        qtbot.wait(20)
+        table.setProperty("contentY", 900.0)
+        qtbot.wait(20)
+        saved_content_y = float(table.property("contentY"))
+        assert saved_content_y > 0
+        assert named(root, "detailSegments").property("text") == "109 / 402"
+
+        updated = [dict(task) for task in tasks]
+        updated[12] = {**updated[12], "completed": 200}
+        bridge.tasks.replace(updated)
+        qtbot.wait(40)
+
+        assert abs(float(table.property("contentY")) - saved_content_y) <= 1
+        assert table.property("currentIndex") == 12
+        assert named(root, "detailSegments").property("text") == "200 / 402"
+    finally:
+        bridge.close()
+        del engine
+
+
 def test_compact_detail_and_log_stack_without_horizontal_overflow(qtbot) -> None:
     for width in (1099, 820):
         engine, root, bridge, warnings = load_qml(qtbot, tasks=six_tasks(), width=width, height=900)

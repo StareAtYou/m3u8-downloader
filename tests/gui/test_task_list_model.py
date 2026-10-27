@@ -71,6 +71,75 @@ def test_replace_inserts_updates_moves_and_removes_by_task_id(qtbot) -> None:
     assert model.item(1)["task_id"] == "3"
 
 
+def test_replace_updates_stable_task_rows_without_resetting_the_model(qtbot) -> None:
+    model = TaskListModel()
+    model.replace([task("1"), task("2")])
+    changes = []
+    resets = []
+    counts = []
+    model.dataChanged.connect(
+        lambda first, last, changed_roles: changes.append((first.row(), last.row(), set(changed_roles)))
+    )
+    model.modelReset.connect(lambda: resets.append(True))
+    model.countChanged.connect(lambda: counts.append(True))
+
+    model.replace([task("1", completed=7), task("2")])
+
+    assert changes == [(0, 0, set(roles(model).values()))]
+    assert resets == []
+    assert counts == []
+    assert model.item(0)["completed"] == 7
+
+
+def test_replace_identical_snapshot_emits_no_refresh_signals(qtbot) -> None:
+    model = TaskListModel()
+    snapshot = [task("1"), task("2")]
+    model.replace(snapshot)
+    changes = []
+    resets = []
+    counts = []
+    model.dataChanged.connect(lambda *_: changes.append(True))
+    model.modelReset.connect(lambda: resets.append(True))
+    model.countChanged.connect(lambda: counts.append(True))
+
+    model.replace(snapshot)
+
+    assert changes == []
+    assert resets == []
+    assert counts == []
+
+
+def test_stable_state_change_notifies_completed_count_without_count_change(qtbot) -> None:
+    model = TaskListModel()
+    model.replace([task("1"), task("2")])
+    completed_counts = []
+    counts = []
+    model.completedCountChanged.connect(lambda: completed_counts.append(model.completedCount))
+    model.countChanged.connect(lambda: counts.append(True))
+
+    model.replace([task("1", state="completed", completed=10), task("2")])
+
+    assert completed_counts == [1]
+    assert counts == []
+
+
+def test_replace_changed_task_identity_uses_structural_reset(qtbot) -> None:
+    model = TaskListModel()
+    model.replace([task("1"), task("2")])
+    changes = []
+    resets = []
+    counts = []
+    model.dataChanged.connect(lambda *_: changes.append(True))
+    model.modelReset.connect(lambda: resets.append(True))
+    model.countChanged.connect(lambda: counts.append(True))
+
+    model.replace([task("2"), task("3")])
+
+    assert changes == []
+    assert resets == [True]
+    assert counts == [True]
+
+
 def test_safe_location_roles_and_completed_count_update_on_replace(qtbot) -> None:
     model = TaskListModel()
     with qtbot.waitSignal(model.countChanged):

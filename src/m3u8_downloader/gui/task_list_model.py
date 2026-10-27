@@ -83,6 +83,7 @@ def _speed(value: float) -> str:
 
 class TaskListModel(QAbstractListModel):
     countChanged = Signal()
+    completedCountChanged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -98,7 +99,7 @@ class TaskListModel(QAbstractListModel):
     def count(self) -> int:
         return len(self._items)
 
-    @Property(int, notify=countChanged)
+    @Property(int, notify=completedCountChanged)
     def completedCount(self) -> int:
         return sum(item.get("state") == "completed" for item in self._items)
 
@@ -148,7 +149,29 @@ class TaskListModel(QAbstractListModel):
 
     def replace(self, snapshots: list[dict[str, Any]]) -> None:
         safe = [{key: value for key, value in snapshot.items() if key in _SAFE_FIELDS} for snapshot in snapshots]
+        old_completed_count = self.completedCount
+        old_task_ids = [item.get("task_id") for item in self._items]
+        new_task_ids = [item.get("task_id") for item in safe]
+        if old_task_ids == new_task_ids:
+            changed_rows = [row for row, (old, new) in enumerate(zip(self._items, safe, strict=True)) if old != new]
+            if not changed_rows:
+                return
+            self._items = safe
+            changed_roles = [int(role) for role in ROLE_NAMES]
+            range_start = previous_row = changed_rows[0]
+            for row in changed_rows[1:]:
+                if row != previous_row + 1:
+                    self.dataChanged.emit(self.index(range_start, 0), self.index(previous_row, 0), changed_roles)
+                    range_start = row
+                previous_row = row
+            self.dataChanged.emit(self.index(range_start, 0), self.index(previous_row, 0), changed_roles)
+            if self.completedCount != old_completed_count:
+                self.completedCountChanged.emit()
+            return
+
         self.beginResetModel()
         self._items = safe
         self.endResetModel()
         self.countChanged.emit()
+        if self.completedCount != old_completed_count:
+            self.completedCountChanged.emit()

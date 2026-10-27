@@ -560,6 +560,7 @@ Rectangle {
         target: page.taskModel
         ignoreUnknownSignals: true
         function onCountChanged() { Qt.callLater(page.refreshSelectedTask) }
+        function onDataChanged() { Qt.callLater(page.refreshSelectedTask) }
     }
     Connections {
         target: taskTable
