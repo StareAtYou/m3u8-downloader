@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from .models import AppSettings, OverwritePolicy, TaskSnapshot, TaskState
 from .naming import build_output_paths
+from .settings_store import SettingsStore
 from .storage import TaskRepository
 from .worker import DownloadTaskSpec, WorkerEvent, run_download_task
 
@@ -92,6 +93,7 @@ class TaskManager:
         repository: TaskRepository,
         workspace_root: Path,
         *,
+        settings_store: SettingsStore | None = None,
         process_launcher: Callable[[DownloadTaskSpec, Any, Any, Any], Any] | None = None,
         event_queue: Any | None = None,
         merge_lock: Any | None = None,
@@ -99,6 +101,7 @@ class TaskManager:
         auto_schedule: bool = True,
     ) -> None:
         self.repository = repository
+        self.settings_store = settings_store or repository
         self.workspace_root = Path(workspace_root)
         self._context = process_context or multiprocessing.get_context("spawn")
         self.event_queue = event_queue or self._context.Queue()
@@ -384,18 +387,18 @@ class TaskManager:
 
     def get_settings(self) -> AppSettings:
         with self._lock:
-            return self.repository.get_settings()
+            return self.settings_store.get_settings()
 
     def update_settings(self, settings: AppSettings) -> AppSettings:
         with self._lock:
             settings.validate()
-            self.repository.update_settings(settings)
+            self.settings_store.update_settings(settings)
             self._schedule_locked()
             return settings
 
     def _make_spec(self, task_id: str) -> DownloadTaskSpec:
         record = self.repository.get_private(task_id)
-        settings = self.repository.get_settings()
+        settings = self.settings_store.get_settings()
         return DownloadTaskSpec(
             task_id=record.task_id,
             url=record.url,
@@ -411,7 +414,7 @@ class TaskManager:
     def _schedule_locked(self) -> None:
         if self._closed or not self._auto_schedule:
             return
-        limit = self.repository.get_settings().max_active_tasks
+        limit = self.settings_store.get_settings().max_active_tasks
         available = limit - len(self._running)
         if available <= 0:
             return

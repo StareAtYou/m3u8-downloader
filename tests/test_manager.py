@@ -9,6 +9,7 @@ import pytest
 
 from m3u8_downloader.manager import Submission, TaskManager
 from m3u8_downloader.models import AppSettings, OverwritePolicy, TaskState
+from m3u8_downloader.settings_store import JsonSettingsStore
 from m3u8_downloader.storage import TaskRepository
 from m3u8_downloader.worker import WorkerEvent
 
@@ -341,6 +342,35 @@ def test_worker_spec_receives_explicit_proxy_policy(tmp_path: Path) -> None:
 
     assert launcher.specs[-1].proxy_policy == "manual"
     assert launcher.specs[-1].manual_proxy == "socks5://127.0.0.1:7890"
+
+
+def test_manager_uses_injected_settings_store_for_updates_and_worker_specs(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    store = JsonSettingsStore(tmp_path / "settings.json")
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        settings_store=store,
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+    )
+    settings = AppSettings(
+        default_save_dir=str(tmp_path),
+        max_active_tasks=2,
+        segment_threads=7,
+        proxy_policy="direct",
+        ffmpeg_path="/custom/ffmpeg",
+    )
+
+    instance.update_settings(settings)
+    instance.submit("https://example/settings.m3u8", "Settings", tmp_path)
+
+    assert instance.get_settings() == settings
+    assert launcher.specs[-1].segment_workers == 7
+    assert launcher.specs[-1].proxy_policy == "direct"
+    assert launcher.specs[-1].ffmpeg_path == "/custom/ffmpeg"
 
 
 def test_disabled_auto_schedule_stays_disabled_after_resume(tmp_path: Path) -> None:

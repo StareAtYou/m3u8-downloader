@@ -5,6 +5,7 @@ from pathlib import Path
 
 from m3u8_downloader.manager import TaskManager
 from m3u8_downloader.models import AppSettings, TaskState
+from m3u8_downloader.settings_store import JsonSettingsStore
 from m3u8_downloader.storage import TaskRepository
 
 
@@ -19,6 +20,44 @@ def _drain_until(manager: TaskManager, task_id: str, target: TaskState, timeout:
             raise AssertionError(f"resumed task failed: {snapshot!r}")
         time.sleep(0.05)
     raise AssertionError(f"task did not reach {target}: {manager.get(task_id)!r}")
+
+
+def test_settings_file_survives_complete_manager_restart(tmp_path: Path) -> None:
+    database = tmp_path / "data" / "tasks.sqlite3"
+    settings_path = tmp_path / "config" / "settings.json"
+    first_repository = TaskRepository(database)
+    first_manager = TaskManager(
+        first_repository,
+        tmp_path / "cache" / "workspaces",
+        settings_store=JsonSettingsStore(settings_path, fallback=first_repository.get_settings),
+        auto_schedule=False,
+    )
+    expected = AppSettings(
+        default_save_dir="/videos",
+        max_active_tasks=6,
+        segment_threads=20,
+        proxy_policy="manual",
+        manual_proxy="http://127.0.0.1:8080",
+        ffmpeg_path="/usr/local/bin/ffmpeg",
+        theme="system",
+        close_behavior="shutdown",
+    )
+    first_manager.update_settings(expected)
+    first_manager.shutdown(timeout=0)
+    first_repository.close()
+
+    second_repository = TaskRepository(database)
+    second_manager = TaskManager(
+        second_repository,
+        tmp_path / "cache" / "workspaces",
+        settings_store=JsonSettingsStore(settings_path, fallback=second_repository.get_settings),
+        auto_schedule=False,
+    )
+    try:
+        assert second_manager.get_settings() == expected
+    finally:
+        second_manager.shutdown(timeout=0)
+        second_repository.close()
 
 
 def test_restart_marks_active_task_interrupted_and_retry_ignores_stale_part(
