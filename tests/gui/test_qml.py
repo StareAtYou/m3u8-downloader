@@ -93,6 +93,10 @@ def test_table_contract_responsive_columns_controls_and_navigation(qtbot) -> Non
     assert root.findChild(object, "pauseAllAction") is not None
     assert root.findChild(object, "showWindowAction") is not None
     assert root.findChild(object, "quitAction") is not None
+    pause_all = named(root, "pauseAllButton")
+    resume_all = named(root, "resumeAllButton")
+    assert pause_all.property("enabled") is True
+    assert resume_all.property("enabled") is True
 
     speed_column = root.findChild(object, "speedColumnHeader")
     assert speed_column.property("visible") is True
@@ -115,6 +119,46 @@ def test_table_contract_responsive_columns_controls_and_navigation(qtbot) -> Non
     assert overwrite.property("visible") is True
     bridge.close()
     del engine
+
+
+def test_bulk_controls_and_delete_dialog_send_exact_service_requests(qtbot) -> None:
+    engine, root, bridge, warnings = load_qml(qtbot, tasks=six_tasks(), width=1100, height=900)
+    try:
+        assert warnings == []
+        client = bridge.client
+        pause_all = named(root, "pauseAllButton")
+        resume_all = named(root, "resumeAllButton")
+        assert QMetaObject.invokeMethod(pause_all, "clicked")
+        qtbot.waitUntil(lambda: client.calls[-1] == ("pause_all", {}))
+        assert QMetaObject.invokeMethod(resume_all, "clicked")
+        qtbot.waitUntil(lambda: client.calls[-1] == ("resume_all", {}))
+
+        root.setProperty("currentPage", 1)
+        qtbot.wait(20)
+        completed_page = named(root, "completedPage")
+        completed_row = next(
+            row for row in visual_descendants(completed_page, "completedRow") if row.property("visible")
+        )
+        completed_delete = visual_named(completed_row, "completedDeleteButton")
+        assert QMetaObject.invokeMethod(completed_delete, "clicked")
+        delete_dialog = root.findChild(object, "deleteTaskDialog")
+        assert delete_dialog is not None
+        qtbot.waitUntil(lambda: delete_dialog.property("visible") is True)
+        assert "城市夜景延时摄影" in named(root, "deleteTaskMessage").property("text")
+        record_only = root.findChild(object, "deleteRecordOnlyButton")
+        assert record_only is not None
+        assert QMetaObject.invokeMethod(record_only, "clicked")
+        qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "6", "delete_files": False}))
+
+        assert QMetaObject.invokeMethod(completed_delete, "clicked")
+        qtbot.waitUntil(lambda: delete_dialog.property("visible") is True)
+        record_and_files = root.findChild(object, "deleteRecordAndFilesButton")
+        assert record_and_files is not None
+        assert QMetaObject.invokeMethod(record_and_files, "clicked")
+        qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "6", "delete_files": True}))
+    finally:
+        bridge.close()
+        del engine
 
 
 def test_batch_validation_is_all_or_nothing_and_overwrite_maps_to_payload(qtbot) -> None:

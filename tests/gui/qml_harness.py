@@ -22,8 +22,10 @@ class Subscription:
 class StaticClient:
     def __init__(self, tasks: list[dict] | None = None) -> None:
         self.tasks = list(tasks or [])
+        self.calls: list[tuple[str, dict]] = []
 
     def request(self, action, payload, request_id=None):
+        self.calls.append((action, payload))
         if action == "list":
             return {"tasks": self.tasks}
         if action == "get_settings":

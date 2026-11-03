@@ -21,6 +21,7 @@ ApplicationWindow {
     property bool trayAvailable: false
     property string errorMessage: ""
     property var pendingTask: ({})
+    property var pendingDeleteTask: ({})
     readonly property bool compactLayout: width < 1100
     readonly property bool horizontalOverflow: urlInput.x < 0
         || batchAddButton.x + batchAddButton.width > composer.width
@@ -28,6 +29,11 @@ ApplicationWindow {
     Action { id: pauseAllAction; objectName: "pauseAllAction"; text: "暂停全部"; onTriggered: bridge.pauseAll() }
     Action { id: showWindowAction; objectName: "showWindowAction"; text: "显示主窗口"; onTriggered: window.show() }
     Action { id: quitAction; objectName: "quitAction"; text: "退出"; onTriggered: Qt.quit() }
+
+    function requestTaskDeletion(taskId, taskName, finalPath) {
+        pendingDeleteTask = {"taskId": taskId, "taskName": taskName, "finalPath": finalPath}
+        deleteTaskDialog.open()
+    }
 
     Rectangle {
         id: sidebar
@@ -224,12 +230,19 @@ ApplicationWindow {
         anchors.bottom: parent.bottom
         visible: window.currentPage === 0
         taskModel: bridge.tasks
+        onDeleteRequested: function(taskId, taskName, finalPath) {
+            window.requestTaskDeletion(taskId, taskName, finalPath)
+        }
     }
     CompletedPage {
+        id: completed
         objectName: "completedPage"
         anchors.fill: downloads
         visible: window.currentPage === 1
         taskModel: bridge.tasks
+        onDeleteRequested: function(taskId, taskName, finalPath) {
+            window.requestTaskDeletion(taskId, taskName, finalPath)
+        }
     }
     SettingsPage {
         objectName: "settingsPage"
@@ -280,6 +293,62 @@ ApplicationWindow {
                 onClicked: {
                     overwriteConflictDialog.close()
                     bridge.submitTask(window.pendingTask.url, window.pendingTask.task_name, window.pendingTask.save_root, true)
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: deleteTaskDialog
+        objectName: "deleteTaskDialog"
+        title: "删除任务"
+        modal: true
+        width: Math.min(window.width - 48, 560)
+        anchors.centerIn: parent
+        onOpened: deleteRecordOnlyButton.forceActiveFocus()
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label {
+                id: deleteTaskMessage
+                objectName: "deleteTaskMessage"
+                Layout.fillWidth: true
+                text: "确认删除任务“" + (window.pendingDeleteTask.taskName || "") + "”？"
+                color: AppTheme.Theme.text
+                font.pixelSize: 15
+                wrapMode: Text.Wrap
+            }
+            Label {
+                Layout.fillWidth: true
+                text: "仅删除记录不会触碰本地文件。删除记录和本地文件会清理任务分片；仅当任务已完成且输出路径未被其他记录引用时，才会同时删除以下视频文件：\n"
+                    + (window.pendingDeleteTask.finalPath || "")
+                color: AppTheme.Theme.muted
+                font.pixelSize: 13
+                wrapMode: Text.Wrap
+            }
+        }
+        footer: DialogButtonBox {
+            Button {
+                objectName: "deleteCancelButton"
+                text: "取消"
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+            Button {
+                id: deleteRecordOnlyButton
+                objectName: "deleteRecordOnlyButton"
+                text: "仅删除记录"
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+                onClicked: {
+                    deleteTaskDialog.close()
+                    bridge.deleteTask(window.pendingDeleteTask.taskId || "", false)
+                }
+            }
+            Button {
+                objectName: "deleteRecordAndFilesButton"
+                text: "删除记录和本地文件"
+                DialogButtonBox.buttonRole: DialogButtonBox.DestructiveRole
+                onClicked: {
+                    deleteTaskDialog.close()
+                    bridge.deleteTask(window.pendingDeleteTask.taskId || "", true)
                 }
             }
         }

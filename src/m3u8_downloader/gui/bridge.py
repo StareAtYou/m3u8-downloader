@@ -90,6 +90,7 @@ class AppBridge(QObject):
             "minus": "fa6s.minus",
             "checkmark": "fa6s.check",
             "chevron-down": "fa6s.chevron-down",
+            "trash": "fa6s.trash-can",
         }
         return qta.charmap(icons.get(name, "fa6s.circle"))
 
@@ -233,6 +234,14 @@ class AppBridge(QObject):
     @Slot()
     def pauseAll(self) -> None:
         self._request("pause_all", {})
+
+    @Slot()
+    def resumeAll(self) -> None:
+        self._request("resume_all", {})
+
+    @Slot(str, bool)
+    def deleteTask(self, task_id: str, delete_files: bool) -> None:
+        self._request("delete_task", {"task_id": task_id, "delete_files": delete_files})
 
     @Slot()
     def loadSettings(self) -> None:

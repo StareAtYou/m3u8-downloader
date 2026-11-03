@@ -45,9 +45,7 @@ def test_lists_newest_first_with_deterministic_tie_break_and_oldest_on_request(t
     repository = TaskRepository(tmp_path / "tasks.sqlite3")
     create_task(repository, "task-a")
     create_task(repository, "task-b")
-    repository._connection.execute(
-        "UPDATE tasks SET created_at = ?", ("2026-11-03T12:00:00+00:00",)
-    )
+    repository._connection.execute("UPDATE tasks SET created_at = ?", ("2026-11-03T12:00:00+00:00",))
     repository._connection.commit()
 
     assert [item.task_id for item in repository.list_snapshots()] == ["task-b", "task-a"]

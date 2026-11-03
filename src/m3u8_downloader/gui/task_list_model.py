@@ -28,6 +28,7 @@ class TaskRole(IntEnum):
     CAN_OPEN = Qt.UserRole + 17
     REDACTED_URL = Qt.UserRole + 18
     SAVE_ROOT = Qt.UserRole + 19
+    CAN_DELETE = Qt.UserRole + 20
 
 
 ROLE_NAMES = {
@@ -50,6 +51,7 @@ ROLE_NAMES = {
     TaskRole.CAN_OPEN: b"canOpen",
     TaskRole.REDACTED_URL: b"redactedUrl",
     TaskRole.SAVE_ROOT: b"saveRoot",
+    TaskRole.CAN_DELETE: b"canDelete",
 }
 
 _SAFE_FIELDS = {
@@ -84,6 +86,8 @@ def _speed(value: float) -> str:
 class TaskListModel(QAbstractListModel):
     countChanged = Signal()
     completedCountChanged = Signal()
+    pausableCountChanged = Signal()
+    pausedCountChanged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -102,6 +106,17 @@ class TaskListModel(QAbstractListModel):
     @Property(int, notify=completedCountChanged)
     def completedCount(self) -> int:
         return sum(item.get("state") == "completed" for item in self._items)
+
+    @Property(int, notify=pausableCountChanged)
+    def pausableCount(self) -> int:
+        return sum(
+            item.get("state") in {"queued", "probing", "parsing", "downloading", "waiting_merge"}
+            for item in self._items
+        )
+
+    @Property(int, notify=pausedCountChanged)
+    def pausedCount(self) -> int:
+        return sum(item.get("state") == "paused" for item in self._items)
 
     def item(self, row: int) -> dict[str, Any]:
         return dict(self._items[row])
@@ -141,6 +156,7 @@ class TaskListModel(QAbstractListModel):
             in {"queued", "probing", "parsing", "downloading", "paused", "waiting_merge", "interrupted"},
             TaskRole.CAN_RETRY: state in {"failed", "canceled", "interrupted"},
             TaskRole.CAN_OPEN: state == "completed",
+            TaskRole.CAN_DELETE: state in {"paused", "failed", "canceled", "interrupted", "completed"},
         }
         try:
             return values[TaskRole(role)]
@@ -150,6 +166,8 @@ class TaskListModel(QAbstractListModel):
     def replace(self, snapshots: list[dict[str, Any]]) -> None:
         safe = [{key: value for key, value in snapshot.items() if key in _SAFE_FIELDS} for snapshot in snapshots]
         old_completed_count = self.completedCount
+        old_pausable_count = self.pausableCount
+        old_paused_count = self.pausedCount
         old_task_ids = [item.get("task_id") for item in self._items]
         new_task_ids = [item.get("task_id") for item in safe]
         if old_task_ids == new_task_ids:
@@ -167,6 +185,10 @@ class TaskListModel(QAbstractListModel):
             self.dataChanged.emit(self.index(range_start, 0), self.index(previous_row, 0), changed_roles)
             if self.completedCount != old_completed_count:
                 self.completedCountChanged.emit()
+            if self.pausableCount != old_pausable_count:
+                self.pausableCountChanged.emit()
+            if self.pausedCount != old_paused_count:
+                self.pausedCountChanged.emit()
             return
 
         self.beginResetModel()
@@ -175,3 +197,7 @@ class TaskListModel(QAbstractListModel):
         self.countChanged.emit()
         if self.completedCount != old_completed_count:
             self.completedCountChanged.emit()
+        if self.pausableCount != old_pausable_count:
+            self.pausableCountChanged.emit()
+        if self.pausedCount != old_paused_count:
+            self.pausedCountChanged.emit()

@@ -48,6 +48,7 @@ def test_snapshot_roles_are_display_safe_and_complete(qtbot) -> None:
         "canCancel",
         "canRetry",
         "canOpen",
+        "canDelete",
     }.issubset(names)
     index = model.index(0, 0)
     assert model.data(index, names["taskId"]) == "1"
@@ -123,6 +124,40 @@ def test_stable_state_change_notifies_completed_count_without_count_change(qtbot
     assert counts == []
 
 
+def test_bulk_action_counts_and_delete_eligibility_follow_task_states(qtbot) -> None:
+    model = TaskListModel()
+    model.replace(
+        [
+            task("1", state="downloading"),
+            task("2", state="paused"),
+            task("3", state="completed", completed=10),
+        ]
+    )
+    pausable_changes = []
+    paused_changes = []
+    model.pausableCountChanged.connect(lambda: pausable_changes.append(model.pausableCount))
+    model.pausedCountChanged.connect(lambda: paused_changes.append(model.pausedCount))
+
+    assert model.pausableCount == 1
+    assert model.pausedCount == 1
+    assert model.get(0)["canDelete"] is False
+    assert model.get(1)["canDelete"] is True
+    assert model.get(2)["canDelete"] is True
+
+    model.replace(
+        [
+            task("1", state="paused"),
+            task("2", state="paused"),
+            task("3", state="completed", completed=10),
+        ]
+    )
+
+    assert pausable_changes == [0]
+    assert paused_changes == [2]
+    assert model.pausableCount == 0
+    assert model.pausedCount == 2
+
+
 def test_replace_changed_task_identity_uses_structural_reset(qtbot) -> None:
     model = TaskListModel()
     model.replace([task("1"), task("2")])
@@ -183,4 +218,5 @@ def test_full_url_fields_never_enter_presentation_roles(qtbot) -> None:
         "canCancel",
         "canRetry",
         "canOpen",
+        "canDelete",
     }

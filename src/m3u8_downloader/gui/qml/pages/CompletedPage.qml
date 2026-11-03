@@ -9,6 +9,7 @@ import "../theme" as AppTheme
 Rectangle {
     id: page
     property var taskModel
+    signal deleteRequested(string taskId, string taskName, string finalPath)
     color: AppTheme.Theme.window
 
     Text {
@@ -37,6 +38,7 @@ Rectangle {
         delegate: Rectangle {
             id: row
             objectName: "completedRow"
+            required property string taskId
             required property string taskName
             required property string filename
             required property string taskState
@@ -61,6 +63,14 @@ Rectangle {
                     contentItem: Icon { name: "folder"; color: AppTheme.Theme.text }
                     ToolTip.visible: hovered
                     ToolTip.text: "打开输出目录"
+                }
+                ToolButton {
+                    objectName: "completedDeleteButton"
+                    onClicked: page.deleteRequested(row.taskId, row.taskName, row.finalPath)
+                    background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
+                    contentItem: Icon { name: "trash"; color: AppTheme.Theme.red }
+                    ToolTip.visible: hovered
+                    ToolTip.text: "删除任务"
                 }
             }
         }

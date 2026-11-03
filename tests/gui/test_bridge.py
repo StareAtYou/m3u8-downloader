@@ -101,6 +101,14 @@ def test_preview_submit_overwrite_controls_and_settings_are_async(qtbot) -> None
 
     bridge.controlTask("pause", "task-1")
     qtbot.waitUntil(lambda: client.calls[-1][0] == "pause")
+    bridge.pauseAll()
+    qtbot.waitUntil(lambda: client.calls[-1] == ("pause_all", {}))
+    bridge.resumeAll()
+    qtbot.waitUntil(lambda: client.calls[-1] == ("resume_all", {}))
+    bridge.deleteTask("task-1", False)
+    qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "task-1", "delete_files": False}))
+    bridge.deleteTask("task-2", True)
+    qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "task-2", "delete_files": True}))
     bridge.loadSettings()
     qtbot.waitUntil(
         lambda: (
