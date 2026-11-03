@@ -12,10 +12,10 @@ def create_task(repository: TaskRepository, task_id: str = "task-1"):
         task_id=task_id,
         url="https://media.example/video.m3u8?token=private",
         task_name="演示",
-        filename="演示.mp4",
+        filename=f"演示-{task_id}.mp4",
         save_root="/tmp/videos",
         workspace=f"/tmp/work/{task_id}",
-        final_path="/tmp/videos/演示/演示.mp4",
+        final_path=f"/tmp/videos/演示/{task_id}.mp4",
         overwrite_policy=OverwritePolicy.REJECT,
     )
 
@@ -39,6 +39,19 @@ def test_rolls_back_explicit_transaction(tmp_path: Path) -> None:
         raise RuntimeError("rollback")
 
     assert repository.list_snapshots() == []
+
+
+def test_lists_newest_first_with_deterministic_tie_break_and_oldest_on_request(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    create_task(repository, "task-a")
+    create_task(repository, "task-b")
+    repository._connection.execute(  # noqa: SLF001 - controlled storage ordering fixture
+        "UPDATE tasks SET created_at = ?", ("2026-11-03T12:00:00+00:00",)
+    )
+    repository._connection.commit()  # noqa: SLF001 - controlled storage ordering fixture
+
+    assert [item.task_id for item in repository.list_snapshots()] == ["task-b", "task-a"]
+    assert [item.task_id for item in repository.list_snapshots(newest_first=False)] == ["task-a", "task-b"]
 
 
 def test_recovers_active_tasks_as_interrupted(tmp_path: Path) -> None:

@@ -151,8 +151,11 @@ class TaskRepository:
     def get_snapshot(self, task_id: str) -> TaskSnapshot:
         return self.get_private(task_id).to_snapshot()
 
-    def list_snapshots(self) -> list[TaskSnapshot]:
-        rows = self._connection.execute("SELECT * FROM tasks ORDER BY created_at, task_id").fetchall()
+    def list_snapshots(self, *, newest_first: bool = True) -> list[TaskSnapshot]:
+        direction = "DESC" if newest_first else "ASC"
+        rows = self._connection.execute(
+            f"SELECT * FROM tasks ORDER BY created_at {direction}, task_id {direction}"
+        ).fetchall()
         return [self._record_from_row(row).to_snapshot() for row in rows]
 
     def update_state(self, task_id: str, target: TaskState, *, error: str | None = None) -> TaskRecord:

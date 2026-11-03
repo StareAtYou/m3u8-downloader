@@ -362,7 +362,7 @@ class TaskManager:
             return
         queued = [
             item
-            for item in self.repository.list_snapshots()
+            for item in self.repository.list_snapshots(newest_first=False)
             if item.state is TaskState.QUEUED and item.task_id not in self._running
         ]
         for snapshot in queued[:available]:

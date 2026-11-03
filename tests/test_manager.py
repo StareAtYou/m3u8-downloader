@@ -166,6 +166,21 @@ def test_scheduler_enforces_limit_drains_events_and_reaps_processes(tmp_path: Pa
     assert repository.get_snapshot(tasks[1].task_id).state == TaskState.FAILED
 
 
+def test_newest_first_display_keeps_oldest_first_scheduler(tmp_path: Path) -> None:
+    instance, _, launcher, events = manager(tmp_path, max_active=1)
+    tasks = [instance.submit(f"https://example/{index}.m3u8", f"Task {index}", tmp_path) for index in range(3)]
+
+    assert [item.task_id for item in instance.list()] == [task.task_id for task in reversed(tasks)]
+    assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id]
+
+    _put_success(events, tasks[0].task_id)
+    launcher.processes[0].alive = False
+    launcher.processes[0].exitcode = 0
+    instance.drain_worker_events()
+
+    assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id, tasks[1].task_id]
+
+
 def test_control_commands_settings_restart_and_bounded_shutdown(tmp_path: Path) -> None:
     instance, repository, launcher, events = manager(tmp_path, max_active=1)
     first = instance.submit("https://example/1.m3u8", "First", tmp_path)
