@@ -45,10 +45,10 @@ def test_lists_newest_first_with_deterministic_tie_break_and_oldest_on_request(t
     repository = TaskRepository(tmp_path / "tasks.sqlite3")
     create_task(repository, "task-a")
     create_task(repository, "task-b")
-    repository._connection.execute(  # noqa: SLF001 - controlled storage ordering fixture
+    repository._connection.execute(
         "UPDATE tasks SET created_at = ?", ("2026-11-03T12:00:00+00:00",)
     )
-    repository._connection.commit()  # noqa: SLF001 - controlled storage ordering fixture
+    repository._connection.commit()
 
     assert [item.task_id for item in repository.list_snapshots()] == ["task-b", "task-a"]
     assert [item.task_id for item in repository.list_snapshots(newest_first=False)] == ["task-a", "task-b"]
@@ -63,6 +63,20 @@ def test_recovers_active_tasks_as_interrupted(tmp_path: Path) -> None:
 
     assert [record.state for record in recovered] == [TaskState.INTERRUPTED]
     assert repository.get_private(task.task_id).state == TaskState.INTERRUPTED
+
+
+def test_delete_task_removes_only_the_requested_record(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    create_task(repository, "task-a")
+    create_task(repository, "task-b")
+
+    repository.delete_task("task-a")
+
+    with pytest.raises(KeyError):
+        repository.get_private("task-a")
+    assert repository.get_private("task-b").task_id == "task-b"
+    with pytest.raises(KeyError):
+        repository.delete_task("missing")
 
 
 def test_validates_and_persists_settings(tmp_path: Path) -> None:

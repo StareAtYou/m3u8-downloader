@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from m3u8_downloader.manager import Submission, TaskManager
-from m3u8_downloader.models import AppSettings, TaskState
+from m3u8_downloader.models import AppSettings, OverwritePolicy, TaskState
 from m3u8_downloader.storage import TaskRepository
 from m3u8_downloader.worker import WorkerEvent
 
@@ -147,6 +147,23 @@ def _put_success(events, task_id: str) -> None:
         events.put(WorkerEvent(task_id, state, {}))
 
 
+def _manual_manager(tmp_path: Path) -> tuple[TaskManager, TaskRepository]:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    return TaskManager(repository, tmp_path / "workspaces", auto_schedule=False), repository
+
+
+def _complete(repository: TaskRepository, task_id: str) -> None:
+    for state in (
+        TaskState.PROBING,
+        TaskState.PARSING,
+        TaskState.DOWNLOADING,
+        TaskState.WAITING_MERGE,
+        TaskState.MERGING,
+        TaskState.COMPLETED,
+    ):
+        repository.update_state(task_id, state)
+
+
 def test_scheduler_enforces_limit_drains_events_and_reaps_processes(tmp_path: Path) -> None:
     instance, repository, launcher, events = manager(tmp_path, max_active=2)
     tasks = [instance.submit(f"https://example/{index}.m3u8", f"Task {index}", tmp_path) for index in range(3)]
@@ -179,6 +196,106 @@ def test_newest_first_display_keeps_oldest_first_scheduler(tmp_path: Path) -> No
     instance.drain_worker_events()
 
     assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id, tasks[1].task_id]
+
+
+def test_delete_record_only_preserves_files_and_active_worker_is_rejected(tmp_path: Path) -> None:
+    active, _, _, _ = manager(tmp_path / "active", max_active=1)
+    running = active.submit("https://example/running.m3u8", "Running", tmp_path / "active")
+    with pytest.raises(ValueError, match="暂停或结束"):
+        active.delete(running.task_id)
+
+    instance, repository = _manual_manager(tmp_path / "idle")
+    task = instance.submit("https://example/idle.m3u8", "Idle", tmp_path / "idle")
+    workspace = Path(task.workspace)
+    final_path = Path(task.final_path)
+    workspace.mkdir(parents=True)
+    workspace.joinpath("segment.ts").write_bytes(b"segment")
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(b"video")
+
+    result = instance.delete(task.task_id)
+
+    assert result == {"task_id": task.task_id, "deleted_files": []}
+    assert workspace.exists()
+    assert final_path.exists()
+    with pytest.raises(KeyError):
+        repository.get_private(task.task_id)
+
+
+def test_delete_files_removes_exact_owned_paths_but_keeps_parents_and_noncompleted_output(tmp_path: Path) -> None:
+    instance, repository = _manual_manager(tmp_path)
+    completed = instance.submit("https://example/completed.m3u8", "Completed", tmp_path)
+    _complete(repository, completed.task_id)
+    workspace = Path(completed.workspace)
+    workspace.mkdir(parents=True)
+    workspace.joinpath("segment.ts").write_bytes(b"segment")
+    workspace_sibling = workspace.parent / "keep-workspace"
+    workspace_sibling.mkdir()
+    final_path = Path(completed.final_path)
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(b"video")
+    output_sibling = final_path.parent / "keep.txt"
+    output_sibling.write_text("keep")
+
+    result = instance.delete(completed.task_id, delete_files=True)
+
+    assert set(result["deleted_files"]) == {str(workspace), str(final_path)}
+    assert not workspace.exists()
+    assert not final_path.exists()
+    assert workspace_sibling.is_dir()
+    assert output_sibling.read_text() == "keep"
+    assert final_path.parent.is_dir()
+
+    paused = instance.submit("https://example/paused.m3u8", "Paused", tmp_path)
+    instance.pause(paused.task_id)
+    paused_workspace = Path(paused.workspace)
+    paused_workspace.mkdir(parents=True)
+    paused_final = Path(paused.final_path)
+    paused_final.parent.mkdir(parents=True)
+    paused_final.write_bytes(b"pre-existing")
+
+    instance.delete(paused.task_id, delete_files=True)
+
+    assert not paused_workspace.exists()
+    assert paused_final.read_bytes() == b"pre-existing"
+
+
+def test_delete_files_blocks_shared_completed_output_and_accepts_missing_exact_paths(tmp_path: Path) -> None:
+    instance, repository = _manual_manager(tmp_path)
+    shared = tmp_path / "shared.mp4"
+    first = repository.create_task(
+        task_id="first",
+        url="https://example/first.m3u8",
+        task_name="First",
+        filename=shared.name,
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspace-first"),
+        final_path=str(shared),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    _complete(repository, first.task_id)
+    second = repository.create_task(
+        task_id="second",
+        url="https://example/second.m3u8",
+        task_name="Second",
+        filename=shared.name,
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspace-second"),
+        final_path=str(shared),
+        overwrite_policy=OverwritePolicy.OVERWRITE,
+    )
+    _complete(repository, second.task_id)
+    shared.write_bytes(b"latest")
+
+    with pytest.raises(ValueError, match="其他任务"):
+        instance.delete(first.task_id, delete_files=True)
+    assert shared.read_bytes() == b"latest"
+    assert repository.get_private(first.task_id).task_id == "first"
+
+    repository.delete_task(second.task_id)
+    shared.unlink()
+    result = instance.delete(first.task_id, delete_files=True)
+    assert result == {"task_id": "first", "deleted_files": []}
 
 
 def test_control_commands_settings_restart_and_bounded_shutdown(tmp_path: Path) -> None:

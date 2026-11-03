@@ -19,6 +19,7 @@ ALLOWED_ACTIONS = frozenset(
         "resume_all",
         "cancel",
         "retry",
+        "delete_task",
         "get_settings",
         "update_settings",
         "subscribe",

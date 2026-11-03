@@ -196,6 +196,11 @@ class TaskRepository:
         self._commit_if_needed()
         return self.get_private(task_id)
 
+    def delete_task(self, task_id: str) -> None:
+        self.get_private(task_id)
+        self._connection.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+        self._commit_if_needed()
+
     def recover_interrupted(self) -> list[TaskRecord]:
         placeholders = ",".join("?" for _ in _ACTIVE_STATES)
         rows = self._connection.execute(

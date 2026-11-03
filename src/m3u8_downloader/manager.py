@@ -335,6 +335,53 @@ class TaskManager:
             self._schedule_locked()
             return result
 
+    def delete(self, task_id: str, *, delete_files: bool = False) -> dict[str, object]:
+        with self._lock:
+            record = self.repository.get_private(task_id)
+            if task_id in self._running or record.state in {
+                TaskState.PROBING,
+                TaskState.PARSING,
+                TaskState.DOWNLOADING,
+                TaskState.WAITING_MERGE,
+                TaskState.MERGING,
+                TaskState.CANCELING,
+            }:
+                raise ValueError("活动任务必须先暂停或结束后才能删除")
+
+            workspace = Path(record.workspace)
+            final_path = Path(record.final_path)
+            delete_final = delete_files and record.state is TaskState.COMPLETED and os.path.lexists(final_path)
+            if delete_final:
+                final_key = self._reservation_key(final_path)
+                if any(
+                    item.task_id != task_id and self._reservation_key(item.final_path) == final_key
+                    for item in self.repository.list_snapshots()
+                ):
+                    raise ValueError("输出文件仍被其他任务记录引用，不能自动删除")
+                if not final_path.is_file() and not final_path.is_symlink():
+                    raise ValueError("任务输出路径不是普通文件，不能自动删除")
+
+            deleted_files: list[str] = []
+            if delete_files and os.path.lexists(workspace):
+                self._remove_exact_path(workspace, allow_directory=True)
+                deleted_files.append(str(workspace))
+            if delete_final:
+                self._remove_exact_path(final_path, allow_directory=False)
+                deleted_files.append(str(final_path))
+
+            self.repository.delete_task(task_id)
+            return {"task_id": task_id, "deleted_files": deleted_files}
+
+    @staticmethod
+    def _remove_exact_path(path: Path, *, allow_directory: bool) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            return
+        if allow_directory and path.is_dir():
+            shutil.rmtree(path)
+            return
+        raise ValueError(f"不能删除非预期路径类型: {path}")
+
     def get_settings(self) -> AppSettings:
         with self._lock:
             return self.repository.get_settings()

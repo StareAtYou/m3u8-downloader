@@ -56,6 +56,18 @@ def test_request_validates_version_required_fields_action_and_json_primitives() 
     )
     assert resume_all.action == "resume_all"
 
+    delete_task = RequestFrame.from_mapping(
+        {
+            "type": "request",
+            "version": PROTOCOL_VERSION,
+            "request_id": "req-3",
+            "client_id": "cli-1",
+            "action": "delete_task",
+            "payload": {"task_id": "task-1", "delete_files": False},
+        }
+    )
+    assert delete_task.action == "delete_task"
+
     for invalid in (
         {"type": "request", "version": 999, "request_id": "r", "client_id": "c", "action": "list", "payload": {}},
         {"type": "request", "version": 1, "request_id": "", "client_id": "c", "action": "list", "payload": {}},

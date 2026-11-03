@@ -81,6 +81,9 @@ def test_command_dispatch_correlation_and_persistent_idempotency(tmp_path: Path)
         assert resumed["task"]["state"] == "queued"
         assert client.request("pause_all", {}) == {"task_ids": [task_id]}
         assert client.request("resume_all", {}) == {"task_ids": [task_id]}
+        deleted = client.request("delete_task", {"task_id": task_id, "delete_files": False})
+        assert deleted == {"task_id": task_id, "deleted_files": []}
+        assert client.request("list", {})["tasks"] == []
     finally:
         stop_server(server, thread)
 
@@ -92,7 +95,7 @@ def test_command_dispatch_correlation_and_persistent_idempotency(tmp_path: Path)
             "submit", payload, request_id="same-request"
         )
         assert result == first
-        assert len(reopened.list()) == 1
+        assert reopened.list() == []
     finally:
         stop_server(server2, thread2)
 

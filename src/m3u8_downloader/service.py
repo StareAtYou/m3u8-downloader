@@ -210,6 +210,11 @@ class ServiceServer:
             return {"task": self.manager.cancel(str(payload["task_id"])).to_dict()}
         if action == "retry":
             return {"task": self.manager.retry(str(payload["task_id"])).to_dict()}
+        if action == "delete_task":
+            delete_files = payload.get("delete_files", False)
+            if not isinstance(delete_files, bool):
+                raise ValueError("delete_files 必须是布尔值")
+            return self.manager.delete(str(payload["task_id"]), delete_files=delete_files)
         if action == "get_settings":
             return {"settings": asdict(self.manager.get_settings())}
         if action == "update_settings":
