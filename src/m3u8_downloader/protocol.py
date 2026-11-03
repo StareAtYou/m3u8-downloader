@@ -16,6 +16,7 @@ ALLOWED_ACTIONS = frozenset(
         "pause",
         "pause_all",
         "resume",
+        "resume_all",
         "cancel",
         "retry",
         "get_settings",

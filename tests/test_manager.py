@@ -246,8 +246,10 @@ def test_disabled_auto_schedule_stays_disabled_after_resume(tmp_path: Path) -> N
     assert instance.get(task.task_id).state is TaskState.QUEUED
 
 
-def test_pause_all_skips_merging_and_part_files_do_not_count_as_completed(tmp_path: Path) -> None:
-    instance, repository, _, events = manager(tmp_path, max_active=2)
+def test_pause_all_skips_merging_resume_all_starts_only_paused_and_part_files_do_not_count(
+    tmp_path: Path,
+) -> None:
+    instance, repository, launcher, events = manager(tmp_path, max_active=2)
     first = instance.submit("https://example/1.m3u8", "First", tmp_path)
     second = instance.submit("https://example/2.m3u8", "Second", tmp_path)
     for state in (
@@ -269,6 +271,16 @@ def test_pause_all_skips_merging_and_part_files_do_not_count_as_completed(tmp_pa
     workspace.mkdir(parents=True, exist_ok=True)
     workspace.joinpath("000000.ts.part").write_bytes(b"partial")
     assert repository.get_snapshot(second.task_id).completed == 0
+
+    events.put(WorkerEvent(second.task_id, TaskState.PAUSED, {}))
+    launcher.processes[1].alive = False
+    launcher.processes[1].exitcode = 0
+    instance.drain_worker_events()
+
+    resumed = instance.resume_all()
+    assert resumed == [second.task_id]
+    assert repository.get_snapshot(second.task_id).state is TaskState.QUEUED
+    assert repository.get_snapshot(first.task_id).state is TaskState.MERGING
 
 
 def test_cancel_ignores_in_flight_progress_and_monitor_can_process_later_events(tmp_path: Path) -> None:

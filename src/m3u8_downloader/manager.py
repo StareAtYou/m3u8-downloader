@@ -272,6 +272,14 @@ class TaskManager:
                 paused.append(snapshot.task_id)
         return paused
 
+    def resume_all(self) -> list[str]:
+        resumed = []
+        for snapshot in self.list():
+            if snapshot.state is TaskState.PAUSED:
+                self.resume(snapshot.task_id)
+                resumed.append(snapshot.task_id)
+        return resumed
+
     def resume(self, task_id: str) -> TaskSnapshot:
         with self._lock:
             record = self.repository.get_private(task_id)

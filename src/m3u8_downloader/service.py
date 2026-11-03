@@ -204,6 +204,8 @@ class ServiceServer:
             return {"task_ids": self.manager.pause_all()}
         if action == "resume":
             return {"task": self.manager.resume(str(payload["task_id"])).to_dict()}
+        if action == "resume_all":
+            return {"task_ids": self.manager.resume_all()}
         if action == "cancel":
             return {"task": self.manager.cancel(str(payload["task_id"])).to_dict()}
         if action == "retry":

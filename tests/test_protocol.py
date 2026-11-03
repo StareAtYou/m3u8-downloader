@@ -44,6 +44,18 @@ def test_request_validates_version_required_fields_action_and_json_primitives() 
     )
     assert request.action == "list"
 
+    resume_all = RequestFrame.from_mapping(
+        {
+            "type": "request",
+            "version": PROTOCOL_VERSION,
+            "request_id": "req-2",
+            "client_id": "cli-1",
+            "action": "resume_all",
+            "payload": {},
+        }
+    )
+    assert resume_all.action == "resume_all"
+
     for invalid in (
         {"type": "request", "version": 999, "request_id": "r", "client_id": "c", "action": "list", "payload": {}},
         {"type": "request", "version": 1, "request_id": "", "client_id": "c", "action": "list", "payload": {}},

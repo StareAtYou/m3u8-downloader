@@ -79,6 +79,8 @@ def test_command_dispatch_correlation_and_persistent_idempotency(tmp_path: Path)
         assert paused["task"]["state"] == "paused"
         resumed = client.request("resume", {"task_id": task_id})
         assert resumed["task"]["state"] == "queued"
+        assert client.request("pause_all", {}) == {"task_ids": [task_id]}
+        assert client.request("resume_all", {}) == {"task_ids": [task_id]}
     finally:
         stop_server(server, thread)
 
