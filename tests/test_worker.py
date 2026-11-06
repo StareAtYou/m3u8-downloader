@@ -72,6 +72,19 @@ class Downloader:
         return tuple(results)
 
 
+class MixedResumeDownloader:
+    def download_all(self, playlist, workspace, control, progress):
+        results = []
+        for item in playlist.segments:
+            path = Path(workspace) / item.filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"ts")
+            result = SegmentResult(item, path, 2, item.index < 2)
+            progress(result)
+            results.append(result)
+        return tuple(results)
+
+
 class Merger:
     def __init__(self, before_state=None) -> None:
         self.called = False
@@ -180,6 +193,30 @@ def test_worker_eta_starts_after_first_segment_and_decreases_to_zero(
     progress = [event.payload for event in queue.items if event.state is TaskState.DOWNLOADING]
     assert "eta_seconds" not in progress[0]
     assert [payload["eta_seconds"] for payload in progress[1:]] == pytest.approx([6.0, 3.0, 4 / 3, 0.0])
+
+
+def test_cached_segments_do_not_create_an_artificial_eta_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = iter((0.0, 2.0, 4.0))
+    monkeypatch.setattr("m3u8_downloader.worker.time.monotonic", lambda: next(ticks))
+    queue = EventQueue()
+
+    run_download_task(
+        spec(tmp_path),
+        queue,
+        TaskControl(),
+        Lock(),
+        dependencies=deps(
+            parser=Parser(parsed_playlist(4)),
+            downloader=MixedResumeDownloader(),
+        ),
+    )
+
+    progress = [event.payload for event in queue.items if event.state is TaskState.DOWNLOADING]
+    assert all("eta_seconds" not in payload for payload in progress[:3])
+    assert [payload["eta_seconds"] for payload in progress[3:]] == pytest.approx([2.0, 0.0])
+    assert states(queue)[-1] is TaskState.COMPLETED
 
 
 @pytest.mark.parametrize(

@@ -166,7 +166,6 @@ ApplicationWindow {
             KeyNavigation.tab: batchAddButton
             KeyNavigation.backtab: taskNameInput
             onClicked: {
-                window.pendingTask = {"url": urlInput.text, "task_name": taskNameInput.text}
                 bridge.submitTask(urlInput.text, taskNameInput.text)
             }
         }
@@ -252,7 +251,11 @@ ApplicationWindow {
                 DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
                 onClicked: {
                     overwriteConflictDialog.close()
-                    bridge.submitTaskWithOverwrite(window.pendingTask.url, window.pendingTask.task_name)
+                    bridge.submitTaskWithOverwrite(
+                        window.pendingTask.url,
+                        window.pendingTask.task_name,
+                        window.pendingTask.save_root
+                    )
                 }
             }
         }
@@ -318,10 +321,17 @@ ApplicationWindow {
         target: bridge
         function onRequestFailed(action, message) {
             window.errorMessage = message
-            if (action === "submit" && (message.indexOf("已存在") >= 0 || message.indexOf("占用") >= 0))
-                overwriteConflictDialog.open()
-            else
+            if (action !== "submit")
                 errorDialog.open()
+        }
+        function onRequestFailedDetailed(action, code, message, context) {
+            window.errorMessage = message
+            if (action === "submit" && code === "file_exists" && context && context.overwrite === false) {
+                window.pendingTask = context
+                overwriteConflictDialog.open()
+            } else {
+                errorDialog.open()
+            }
         }
         function onRequestSucceeded(action, result) {
             if (action === "submit") {

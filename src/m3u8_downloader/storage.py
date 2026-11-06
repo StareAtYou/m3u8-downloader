@@ -49,9 +49,11 @@ class TaskRepository:
         version = self.schema_version
         if version >= 2:
             return
-        if version == 0:
-            self._connection.executescript(
-                """
+        try:
+            if version == 0:
+                self._connection.executescript(
+                    """
+                BEGIN IMMEDIATE;
                 CREATE TABLE tasks (
                     task_id TEXT PRIMARY KEY,
                     url TEXT NOT NULL,
@@ -89,18 +91,24 @@ class TaskRepository:
                     PRIMARY KEY(client_id, request_id)
                 );
                 PRAGMA user_version = 2;
+                COMMIT;
                 """
-            )
-        elif version == 1:
-            self._connection.executescript(
-                """
+                )
+            elif version == 1:
+                self._connection.executescript(
+                    """
+                BEGIN IMMEDIATE;
                 ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE tasks ADD COLUMN next_retry_at TEXT;
                 ALTER TABLE tasks ADD COLUMN eta_seconds REAL;
                 PRAGMA user_version = 2;
+                COMMIT;
                 """
-            )
-        self._connection.commit()
+                )
+        except BaseException:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise
 
     @contextmanager
     def transaction(self) -> Iterator[None]:

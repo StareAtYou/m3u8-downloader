@@ -158,6 +158,8 @@ class ServiceServer:
                 return
             try:
                 result = self._dispatch(request)
+            except FileExistsError:
+                raise
             except OSError as exc:
                 raise ProtocolError(
                     "filesystem_error",
@@ -170,7 +172,9 @@ class ServiceServer:
             send_frame(connection, ResponseFrame.error_response(request_id, exc.code, exc.message))
         except KeyError:
             send_frame(connection, ResponseFrame.error_response(request_id, "not_found", "任务不存在"))
-        except (ValueError, FileExistsError) as exc:
+        except FileExistsError as exc:
+            send_frame(connection, ResponseFrame.error_response(request_id, "file_exists", str(exc)))
+        except ValueError as exc:
             send_frame(connection, ResponseFrame.error_response(request_id, "invalid_request", str(exc)))
         except (EOFError, OSError):
             pass

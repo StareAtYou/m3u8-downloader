@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from m3u8_downloader import storage
 from m3u8_downloader.models import AppSettings, OverwritePolicy, TaskState
 from m3u8_downloader.storage import TaskRepository
 
@@ -78,6 +79,67 @@ def test_migrates_v1_database_without_losing_existing_task(tmp_path: Path) -> No
     assert migrated.state is TaskState.FAILED
     assert (migrated.completed, migrated.total, migrated.error) == (3, 10, "旧错误")
     assert (migrated.auto_retry_count, migrated.next_retry_at, migrated.eta_seconds) == (0, None, None)
+
+
+def test_interrupted_v1_migration_rolls_back_every_schema_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, url TEXT NOT NULL, task_name TEXT NOT NULL,
+            filename TEXT NOT NULL, save_root TEXT NOT NULL, workspace TEXT NOT NULL,
+            final_path TEXT NOT NULL, overwrite_policy TEXT NOT NULL, state TEXT NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
+            speed_bps REAL NOT NULL DEFAULT 0, route TEXT NOT NULL DEFAULT '', error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            pause_requested INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE settings (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), value TEXT NOT NULL);
+        CREATE TABLE idempotency (
+            client_id TEXT NOT NULL, request_id TEXT NOT NULL, response TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(client_id, request_id)
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.close()
+    real_connect = sqlite3.connect
+    opened: list[sqlite3.Connection] = []
+
+    def interrupted_connect(*args, **kwargs):
+        candidate = real_connect(*args, **kwargs)
+        alter_count = 0
+
+        def authorizer(action, _first, _second, _database, _trigger):
+            nonlocal alter_count
+            if action == sqlite3.SQLITE_ALTER_TABLE:
+                alter_count += 1
+                if alter_count == 2:
+                    return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        candidate.set_authorizer(authorizer)
+        opened.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(storage.sqlite3, "connect", interrupted_connect)
+    with pytest.raises(sqlite3.DatabaseError):
+        TaskRepository(database)
+    for candidate in opened:
+        candidate.close()
+    monkeypatch.setattr(storage.sqlite3, "connect", real_connect)
+
+    check = real_connect(database)
+    columns = [row[1] for row in check.execute("PRAGMA table_info(tasks)")]
+    version = check.execute("PRAGMA user_version").fetchone()[0]
+    check.close()
+    assert version == 1
+    assert "auto_retry_count" not in columns
+
+    assert TaskRepository(database).schema_version == 2
 
 
 def test_retry_metadata_orders_due_tasks_and_can_activate_or_reset(tmp_path: Path) -> None:

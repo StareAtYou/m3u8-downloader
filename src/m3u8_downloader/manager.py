@@ -40,6 +40,7 @@ class _RunningTask:
     control: Any
     paused_exit_expected: bool = False
     resume_after_pause: bool = False
+    terminal_event_received: bool = False
 
 
 class ProcessTaskControl:
@@ -300,10 +301,15 @@ class TaskManager:
 
     def _resume_locked(self, task_id: str) -> TaskSnapshot:
         record = self.repository.get_private(task_id)
-        if record.state is not TaskState.PAUSED:
-            raise ValueError("只有暂停的任务可以继续")
-        self.repository.set_pause_requested(task_id, False)
         running = self._running.get(task_id)
+        if record.state is not TaskState.PAUSED:
+            if not record.pause_requested or running is None:
+                raise ValueError("只有暂停或正在暂停的任务可以继续")
+            self.repository.set_pause_requested(task_id, False)
+            running.control.resume()
+            running.resume_after_pause = True
+            return self.repository.get_snapshot(task_id)
+        self.repository.set_pause_requested(task_id, False)
         if running is not None:
             running.control.resume()
             running.resume_after_pause = True
@@ -346,8 +352,9 @@ class TaskManager:
                 [{"final_path": record.final_path}],
                 exclude_task_ids=frozenset({task_id}),
             )
-            self.repository.clear_retry_schedule(task_id, reset_count=True)
-            result = self.repository.update_state(task_id, TaskState.QUEUED).to_snapshot()
+            with self.repository.transaction():
+                self.repository.clear_retry_schedule(task_id, reset_count=True)
+                result = self.repository.update_state(task_id, TaskState.QUEUED).to_snapshot()
             self._schedule_locked()
             return result
 
@@ -437,18 +444,22 @@ class TaskManager:
             if item.state is TaskState.QUEUED and item.task_id not in self._running
         ]
         for snapshot in queued[:available]:
-            control = ProcessTaskControl(self._context)
-            spec = self._make_spec(snapshot.task_id)
-            process = self._process_launcher(spec, self.event_queue, control, self.merge_lock)
-            self.controls[snapshot.task_id] = control
-            self._running[snapshot.task_id] = _RunningTask(process, control)
             try:
+                self.repository.update_state(snapshot.task_id, TaskState.PROBING)
+                control = ProcessTaskControl(self._context)
+                spec = self._make_spec(snapshot.task_id)
+                process = self._process_launcher(spec, self.event_queue, control, self.merge_lock)
+                self.controls[snapshot.task_id] = control
+                self._running[snapshot.task_id] = _RunningTask(process, control)
                 process.start()
             except Exception:  # noqa: BLE001 - convert process startup failures to task state
                 self._running.pop(snapshot.task_id, None)
                 self.controls.pop(snapshot.task_id, None)
-                self.repository.update_state(snapshot.task_id, TaskState.FAILED, error="无法启动下载进程")
-                self._schedule_retry_after_failure_locked(snapshot.task_id, "ProcessStartError")
+                self._record_failure_locked(
+                    snapshot.task_id,
+                    error="无法启动下载进程",
+                    error_type="ProcessStartError",
+                )
 
     def drain_worker_events(self) -> int:
         changed = 0
@@ -458,106 +469,145 @@ class TaskManager:
                 if record.task_id in self._running:
                     continue
                 try:
-                    self._validate_output_reservations(
-                        [{"final_path": record.final_path}],
-                        exclude_task_ids=frozenset({record.task_id}),
-                    )
-                    self.repository.activate_scheduled_retry(record.task_id)
+                    with self.repository.transaction():
+                        self._validate_output_reservations(
+                            [{"final_path": record.final_path}],
+                            exclude_task_ids=frozenset({record.task_id}),
+                        )
+                        self.repository.activate_scheduled_retry(record.task_id)
                 except (ValueError, sqlite3.IntegrityError):
-                    self.repository.clear_retry_schedule(record.task_id)
-                    self.repository.update_state(
-                        record.task_id,
-                        TaskState.FAILED,
-                        error="输出路径已被另一个活动任务占用，自动重试已停止",
-                    )
+                    with self.repository.transaction():
+                        self.repository.clear_retry_schedule(record.task_id)
+                        self.repository.update_state(
+                            record.task_id,
+                            TaskState.FAILED,
+                            error="输出路径已被另一个活动任务占用，自动重试已停止",
+                        )
                 changed += 1
-            while True:
-                try:
-                    event = self.event_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(event, Mapping):
-                    event = WorkerEvent(
-                        task_id=str(event["task_id"]),
-                        state=TaskState(event["state"]),
-                        payload=dict(event.get("payload", {})),
-                    )
-                try:
-                    current = self.repository.get_snapshot(event.task_id).state
-                except KeyError:
-                    changed += 1
+            changed += self._drain_event_queue_locked()
+            observed_dead = False
+            for running in tuple(self._running.values()):
+                if running.process.is_alive():
                     continue
-                if (
-                    current in {TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED}
-                    and event.state is not current
-                ):
-                    changed += 1
-                    continue
-                if current is TaskState.CANCELING and event.state not in {
-                    TaskState.CANCELING,
-                    TaskState.CANCELED,
-                    TaskState.FAILED,
-                }:
-                    changed += 1
-                    continue
-                if current is TaskState.PAUSED and event.state is not TaskState.PAUSED:
-                    changed += 1
-                    continue
-                running = self._running.get(event.task_id)
-                if event.state is TaskState.PAUSED and running is not None and running.resume_after_pause:
-                    try:
-                        self.repository.apply_worker_event(event.task_id, event.state, event.payload)
-                        self.repository.set_pause_requested(event.task_id, False)
-                        self.repository.update_state(event.task_id, TaskState.QUEUED)
-                    except ValueError:
-                        changed += 1
-                        continue
-                    running.paused_exit_expected = True
-                    changed += 1
-                    continue
-                try:
-                    self.repository.apply_worker_event(event.task_id, event.state, event.payload)
-                except ValueError:
-                    changed += 1
-                    continue
-                if event.payload.get("pause_rejected") or event.state in {
-                    TaskState.COMPLETED,
-                    TaskState.CANCELED,
-                    TaskState.FAILED,
-                }:
-                    self.repository.set_pause_requested(event.task_id, False)
-                if event.state is TaskState.PAUSED and event.task_id in self._running:
-                    self._running[event.task_id].paused_exit_expected = True
-                if event.state is TaskState.FAILED and current is not TaskState.CANCELING:
-                    self._schedule_retry_after_failure_locked(
-                        event.task_id,
-                        str(event.payload.get("error_type") or "WorkerError"),
-                    )
-                changed += 1
-            self._reap_locked()
+                running.process.join(timeout=0)
+                observed_dead = True
+            if observed_dead:
+                changed += self._drain_event_queue_locked(first_timeout=0.05)
+            changed += self._reap_locked()
             self._schedule_locked()
         return changed
 
-    def _schedule_retry_after_failure_locked(self, task_id: str, error_type: str) -> None:
-        record = self.repository.get_private(task_id)
-        if (
-            record.state is not TaskState.FAILED
-            or record.next_retry_at is not None
-            or error_type == "FileExistsError"
-            or record.auto_retry_count >= len(AUTO_RETRY_DELAYS)
-        ):
-            return
-        delay = AUTO_RETRY_DELAYS[record.auto_retry_count]
-        retry_at = self._clock().astimezone(UTC) + timedelta(seconds=delay)
-        self.repository.schedule_retry(task_id, retry_at.isoformat())
+    def _drain_event_queue_locked(self, *, first_timeout: float = 0.0) -> int:
+        changed = 0
+        first = True
+        while True:
+            try:
+                if first and first_timeout > 0:
+                    event = self.event_queue.get(timeout=first_timeout)
+                else:
+                    event = self.event_queue.get_nowait()
+            except queue.Empty:
+                break
+            first = False
+            changed += self._apply_worker_event_locked(event)
+        return changed
 
-    def _reap_locked(self) -> None:
+    def _apply_worker_event_locked(self, event: WorkerEvent | Mapping[str, Any]) -> int:
+        if isinstance(event, Mapping):
+            event = WorkerEvent(
+                task_id=str(event["task_id"]),
+                state=TaskState(event["state"]),
+                payload=dict(event.get("payload", {})),
+            )
+        try:
+            current = self.repository.get_snapshot(event.task_id).state
+        except KeyError:
+            return 1
+        if current in {TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED} and event.state is not current:
+            return 1
+        if current is TaskState.CANCELING and event.state not in {
+            TaskState.CANCELING,
+            TaskState.CANCELED,
+            TaskState.FAILED,
+        }:
+            return 1
+        if current is TaskState.PAUSED and event.state is not TaskState.PAUSED:
+            return 1
+        running = self._running.get(event.task_id)
+        if event.state is TaskState.PAUSED and running is not None and running.resume_after_pause:
+            try:
+                with self.repository.transaction():
+                    self.repository.apply_worker_event(event.task_id, event.state, event.payload)
+                    self.repository.set_pause_requested(event.task_id, False)
+                    self.repository.update_state(event.task_id, TaskState.QUEUED)
+            except ValueError:
+                return 1
+            running.paused_exit_expected = True
+            return 1
+        try:
+            if event.state is TaskState.FAILED:
+                self._record_failure_locked(
+                    event.task_id,
+                    error=str(event.payload.get("error") or "下载任务失败"),
+                    error_type=str(event.payload.get("error_type") or "WorkerError"),
+                    worker_payload=event.payload,
+                )
+            else:
+                self.repository.apply_worker_event(event.task_id, event.state, event.payload)
+        except ValueError:
+            return 1
+        if event.payload.get("pause_rejected") or event.state in {
+            TaskState.COMPLETED,
+            TaskState.CANCELED,
+        }:
+            self.repository.set_pause_requested(event.task_id, False)
+        if event.state is TaskState.PAUSED and running is not None:
+            running.paused_exit_expected = True
+        if event.state in {TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED} and running is not None:
+            running.terminal_event_received = True
+        return 1
+
+    def _record_failure_locked(
+        self,
+        task_id: str,
+        *,
+        error: str,
+        error_type: str,
+        worker_payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        record = self.repository.get_private(task_id)
+        if record.pause_requested and record.state is not TaskState.CANCELING:
+            with self.repository.transaction():
+                self.repository.set_pause_requested(task_id, False)
+                self.repository.update_state(task_id, TaskState.PAUSED, error=error)
+            return
+        retry_at = None
+        if (
+            record.state is not TaskState.CANCELING
+            and record.next_retry_at is None
+            and error_type != "FileExistsError"
+            and record.auto_retry_count < len(AUTO_RETRY_DELAYS)
+        ):
+            delay = AUTO_RETRY_DELAYS[record.auto_retry_count]
+            retry_at = (self._clock().astimezone(UTC) + timedelta(seconds=delay)).isoformat()
+        with self.repository.transaction():
+            if worker_payload is None:
+                self.repository.update_state(task_id, TaskState.FAILED, error=error)
+            else:
+                self.repository.apply_worker_event(task_id, TaskState.FAILED, worker_payload)
+            self.repository.set_pause_requested(task_id, False)
+            if retry_at is not None:
+                self.repository.schedule_retry(task_id, retry_at)
+
+    def _reap_locked(self) -> int:
+        changed = 0
         for task_id, running in tuple(self._running.items()):
             if running.process.is_alive():
                 continue
-            running.process.join(timeout=0)
             state = self.repository.get_snapshot(task_id).state
-            if running.paused_exit_expected and state in {TaskState.PAUSED, TaskState.QUEUED}:
+            if (
+                running.paused_exit_expected and state in {TaskState.PAUSED, TaskState.QUEUED}
+            ) or running.terminal_event_received:
                 pass
             elif state not in {
                 TaskState.COMPLETED,
@@ -568,10 +618,15 @@ class TaskManager:
                 if state is TaskState.CANCELING:
                     self.repository.update_state(task_id, TaskState.CANCELED)
                 else:
-                    self.repository.update_state(task_id, TaskState.FAILED, error="下载进程意外退出")
-                    self._schedule_retry_after_failure_locked(task_id, "ProcessExitError")
+                    self._record_failure_locked(
+                        task_id,
+                        error="下载进程意外退出",
+                        error_type="ProcessExitError",
+                    )
+                changed += 1
             self._running.pop(task_id, None)
             self.controls.pop(task_id, None)
+        return changed
 
     def shutdown(self, *, timeout: float = 5.0) -> None:
         with self._lock:

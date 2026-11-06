@@ -132,6 +132,7 @@ def run_download_task(
 
         completed = 0
         downloaded_bytes = 0
+        fresh_completed = 0
         download_started = time.monotonic()
         _emit(
             event_queue,
@@ -141,21 +142,23 @@ def run_download_task(
         )
 
         def progress(result: SegmentResult) -> None:
-            nonlocal completed, downloaded_bytes
+            nonlocal completed, downloaded_bytes, fresh_completed
             completed += 1
-            downloaded_bytes += result.bytes_written
-            elapsed = max(time.monotonic() - download_started, 0.001)
-            eta_seconds = elapsed / completed * (len(parsed.segments) - completed)
+            payload: dict[str, int | float] = {
+                "completed": completed,
+                "total": len(parsed.segments),
+            }
+            if not result.resumed:
+                fresh_completed += 1
+                downloaded_bytes += result.bytes_written
+                elapsed = max(time.monotonic() - download_started, 0.001)
+                payload["speed_bps"] = downloaded_bytes / elapsed
+                payload["eta_seconds"] = elapsed / fresh_completed * (len(parsed.segments) - completed)
             _emit(
                 event_queue,
                 spec,
                 TaskState.DOWNLOADING,
-                {
-                    "completed": completed,
-                    "total": len(parsed.segments),
-                    "speed_bps": downloaded_bytes / elapsed,
-                    "eta_seconds": eta_seconds,
-                },
+                payload,
             )
 
         results = dependencies.downloader_factory(client, spec.segment_workers).download_all(

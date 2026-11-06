@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, QUrl
 
 from m3u8_downloader.gui.bridge import AppBridge, ensure_service_running
+from m3u8_downloader.ipc_client import ServiceError
 
 
 class Subscription:
@@ -50,6 +51,50 @@ class Client:
         self.subscribe_count += 1
         self.subscription = Subscription()
         return self.subscription
+
+
+class BlockingConflictClient(Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.alpha_started = threading.Event()
+        self.release_alpha = threading.Event()
+
+    def request(self, action, payload, request_id=None):
+        self.calls.append((action, payload))
+        if action == "submit" and payload.get("task_name") == "Alpha" and not payload.get("overwrite"):
+            self.alpha_started.set()
+            self.release_alpha.wait(2)
+            raise ServiceError("file_exists", "目标文件已存在")
+        if action == "submit":
+            return {"tasks": [{"task_id": "new-task"}]}
+        return super().request(action, payload, request_id)
+
+
+class BlockingSettingsClient(Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings_requested = threading.Event()
+        self.release_settings = threading.Event()
+
+    def request(self, action, payload, request_id=None):
+        if action == "get_settings":
+            self.calls.append((action, payload))
+            self.settings_requested.set()
+            self.release_settings.wait(2)
+            return {
+                "settings": {
+                    "default_save_dir": "/configured",
+                    "overwrite_existing": True,
+                }
+            }
+        return super().request(action, payload, request_id)
+
+
+class FailingControlClient(Client):
+    def request(self, action, payload, request_id=None):
+        if action == "pause":
+            raise ServiceError("invalid_request", "无法暂停")
+        return super().request(action, payload, request_id)
 
 
 def snapshot() -> dict:
@@ -147,6 +192,82 @@ def test_preview_submit_overwrite_controls_and_settings_are_async(qtbot) -> None
     qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "task-2", "delete_files": True}))
     bridge.saveSettings({"default_save_dir": "/videos", "max_active_tasks": 2})
     qtbot.waitUntil(lambda: client.calls[-1][0] == "update_settings")
+    bridge.close()
+
+
+def test_submit_waits_for_settings_and_empty_saved_directory_uses_downloads(qtbot) -> None:
+    client = BlockingSettingsClient()
+    bridge = AppBridge(client)
+    bridge.submitTask("https://example/early.m3u8", "Early")
+    assert client.settings_requested.wait(1)
+    assert not any(action == "submit" for action, _payload in client.calls)
+
+    client.release_settings.set()
+    qtbot.waitUntil(lambda: any(action == "submit" for action, _payload in client.calls))
+    assert client.calls[-1][1]["save_root"] == "/configured"
+    assert client.calls[-1][1]["overwrite"] is True
+
+    bridge._apply_result(
+        "update_settings",
+        {"settings": {"default_save_dir": "", "overwrite_existing": False}},
+    )
+    assert bridge.defaultSaveDir == str(Path.home() / "Downloads")
+    bridge.submitTask("https://example/fallback.m3u8", "Fallback")
+    qtbot.waitUntil(lambda: client.calls[-1][1].get("task_name") == "Fallback")
+    assert client.calls[-1][1]["save_root"] == str(Path.home() / "Downloads")
+    bridge.close()
+
+
+def test_file_conflict_carries_immutable_submission_context(qtbot) -> None:
+    client = BlockingConflictClient()
+    bridge = AppBridge(client)
+    bridge._apply_result(
+        "get_settings",
+        {"settings": {"default_save_dir": "/alpha-root", "overwrite_existing": False}},
+    )
+    failures = []
+    bridge.requestFailedDetailed.connect(
+        lambda action, code, message, context: failures.append((action, code, message, context))
+    )
+
+    bridge.submitTask("https://example/alpha.m3u8", "Alpha")
+    assert client.alpha_started.wait(1)
+    bridge._apply_result(
+        "update_settings",
+        {"settings": {"default_save_dir": "/beta-root", "overwrite_existing": False}},
+    )
+    bridge.submitTask("https://example/beta.m3u8", "Beta")
+    qtbot.waitUntil(
+        lambda: any(payload.get("task_name") == "Beta" for action, payload in client.calls if action == "submit")
+    )
+    client.release_alpha.set()
+    qtbot.waitUntil(lambda: bool(failures))
+
+    action, code, _message, context = failures[0]
+    assert (action, code) == ("submit", "file_exists")
+    assert context == {
+        "url": "https://example/alpha.m3u8",
+        "task_name": "Alpha",
+        "save_root": "/alpha-root",
+        "overwrite": False,
+    }
+    bridge.submitTaskWithOverwrite(context["url"], context["task_name"], context["save_root"])
+    qtbot.waitUntil(lambda: client.calls[-1][1].get("overwrite") is True)
+    assert client.calls[-1][1] == {**context, "overwrite": True}
+    bridge.close()
+
+
+def test_non_submission_failure_uses_an_empty_detail_context(qtbot) -> None:
+    bridge = AppBridge(FailingControlClient())
+    failures = []
+    bridge.requestFailedDetailed.connect(
+        lambda action, code, message, context: failures.append((action, code, message, context))
+    )
+
+    bridge.controlTask("pause", "task-1")
+    qtbot.waitUntil(lambda: bool(failures))
+
+    assert failures == [("pause", "invalid_request", "无法暂停", {})]
     bridge.close()
 
 

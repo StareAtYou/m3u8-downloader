@@ -92,8 +92,11 @@ def test_single_task_conflict_keeps_one_off_overwrite_confirmation(qtbot) -> Non
         named(root, "taskNameInput").setProperty("text", "第 12 集")
         assert QMetaObject.invokeMethod(named(root, "addTaskButton"), "clicked")
         qtbot.waitUntil(lambda: bridge.client.calls[-1][0] == "submit")
+        original = dict(bridge.client.calls[-1][1])
+        named(root, "urlInput").setProperty("text", "https://cdn.example.com/other.m3u8")
+        named(root, "taskNameInput").setProperty("text", "其他任务")
 
-        bridge.requestFailed.emit("submit", "目标文件已存在")
+        bridge.requestFailedDetailed.emit("submit", "file_exists", "目标文件已存在", original)
         conflict = root.findChild(object, "overwriteConflictDialog")
         assert conflict is not None
         qtbot.waitUntil(lambda: conflict.property("visible") is True)
@@ -106,12 +109,32 @@ def test_single_task_conflict_keeps_one_off_overwrite_confirmation(qtbot) -> Non
                     {
                         "url": "https://cdn.example.com/episode.m3u8",
                         "task_name": "第 12 集",
-                        "save_root": bridge.defaultSaveDir,
+                        "save_root": original["save_root"],
                         "overwrite": True,
                     },
                 )
             )
         )
+    finally:
+        bridge.close()
+        del engine
+
+
+def test_non_file_conflict_does_not_offer_overwrite(qtbot) -> None:
+    engine, root, bridge, warnings = load_qml(qtbot)
+    try:
+        assert warnings == []
+        context = {
+            "url": "https://cdn.example.com/episode.m3u8",
+            "task_name": "第 12 集",
+            "save_root": bridge.defaultSaveDir,
+            "overwrite": False,
+        }
+        bridge.requestFailedDetailed.emit("submit", "invalid_request", "输出路径已被另一个活动任务占用", context)
+        error_dialog = root.findChild(object, "errorDialog")
+        conflict_dialog = root.findChild(object, "overwriteConflictDialog")
+        qtbot.waitUntil(lambda: error_dialog.property("visible") is True)
+        assert conflict_dialog.property("visible") is False
     finally:
         bridge.close()
         del engine

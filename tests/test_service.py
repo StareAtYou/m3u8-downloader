@@ -118,6 +118,39 @@ def test_delete_permission_error_is_returned_as_actionable_service_error(
         stop_server(server, thread)
 
 
+def test_submit_distinguishes_existing_file_from_active_output_reservation(tmp_path: Path) -> None:
+    existing = tmp_path / "Existing" / "Existing.mp4"
+    existing.parent.mkdir()
+    existing.write_bytes(b"video")
+    server, thread, key = start_server(tmp_path)
+    client = ServiceClient(server.address, key)
+    try:
+        with pytest.raises(ServiceError, match="已存在") as file_error:
+            client.request(
+                "submit",
+                {
+                    "url": "https://example/existing.m3u8",
+                    "task_name": "Existing",
+                    "save_root": str(tmp_path),
+                    "overwrite": False,
+                },
+            )
+        assert file_error.value.code == "file_exists"
+
+        payload = {
+            "url": "https://example/first.m3u8",
+            "task_name": "Reserved",
+            "save_root": str(tmp_path),
+            "overwrite": False,
+        }
+        client.request("submit", payload)
+        with pytest.raises(ServiceError, match="占用") as reservation_error:
+            client.request("submit", {**payload, "url": "https://example/second.m3u8"})
+        assert reservation_error.value.code == "invalid_request"
+    finally:
+        stop_server(server, thread)
+
+
 def test_batch_dedup_is_atomic_under_two_simultaneous_clients(tmp_path: Path) -> None:
     server, thread, key = start_server(tmp_path)
     barrier = threading.Barrier(2)
