@@ -21,6 +21,7 @@ def test_json_settings_store_persists_all_fields_with_private_permissions(tmp_pa
         ffmpeg_path="/opt/ffmpeg",
         theme="light",
         close_behavior="shutdown",
+        overwrite_existing=True,
     )
 
     JsonSettingsStore(path).update_settings(settings)
@@ -31,6 +32,7 @@ def test_json_settings_store_persists_all_fields_with_private_permissions(tmp_pa
         "ffmpeg_path": "/opt/ffmpeg",
         "manual_proxy": "socks5://127.0.0.1:7890",
         "max_active_tasks": 5,
+        "overwrite_existing": True,
         "proxy_policy": "manual",
         "segment_threads": 24,
         "theme": "light",
@@ -55,6 +57,28 @@ def test_json_settings_store_migrates_fallback_once_and_surfaces_corruption_with
     with pytest.raises(ValueError, match="设置文件"):
         JsonSettingsStore(path).get_settings()
     assert path.read_bytes() == corrupt
+
+
+def test_json_settings_store_defaults_missing_legacy_overwrite_and_rejects_non_boolean(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    legacy = {
+        "default_save_dir": "/legacy",
+        "max_active_tasks": 3,
+        "segment_threads": 16,
+        "proxy_policy": "auto",
+        "manual_proxy": None,
+        "ffmpeg_path": "ffmpeg",
+        "theme": "dark",
+        "close_behavior": "tray",
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert JsonSettingsStore(path).get_settings().overwrite_existing is False
+
+    path.write_text(json.dumps({**legacy, "overwrite_existing": 1}), encoding="utf-8")
+    with pytest.raises(ValueError, match="设置文件内容无效"):
+        JsonSettingsStore(path).get_settings()
 
 
 @pytest.mark.parametrize(

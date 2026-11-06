@@ -44,7 +44,9 @@ class JsonSettingsStore:
         if not isinstance(value, dict):
             raise TypeError(f"设置文件内容必须是 JSON 对象: {self.path}")
         try:
-            return AppSettings(**value).validate()
+            merged = asdict(AppSettings())
+            merged.update(value)
+            return AppSettings(**merged).validate()
         except (TypeError, ValueError) as exc:
             raise ValueError(f"设置文件内容无效: {self.path}") from exc
 

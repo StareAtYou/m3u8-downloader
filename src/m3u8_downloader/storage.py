@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 from collections.abc import Iterator, Mapping
@@ -45,46 +46,60 @@ class TaskRepository:
         return int(self._connection.execute("PRAGMA user_version").fetchone()[0])
 
     def _migrate(self) -> None:
-        if self.schema_version >= 1:
+        version = self.schema_version
+        if version >= 2:
             return
-        self._connection.executescript(
-            """
-            CREATE TABLE tasks (
-                task_id TEXT PRIMARY KEY,
-                url TEXT NOT NULL,
-                task_name TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                save_root TEXT NOT NULL,
-                workspace TEXT NOT NULL,
-                final_path TEXT NOT NULL,
-                overwrite_policy TEXT NOT NULL,
-                state TEXT NOT NULL,
-                completed INTEGER NOT NULL DEFAULT 0,
-                total INTEGER NOT NULL DEFAULT 0,
-                speed_bps REAL NOT NULL DEFAULT 0,
-                route TEXT NOT NULL DEFAULT '',
-                error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                pause_requested INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX tasks_state_idx ON tasks(state);
-            CREATE UNIQUE INDEX tasks_active_output_idx ON tasks(final_path)
-                WHERE state NOT IN ('completed', 'canceled', 'failed');
-            CREATE TABLE settings (
-                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-                value TEXT NOT NULL
-            );
-            CREATE TABLE idempotency (
-                client_id TEXT NOT NULL,
-                request_id TEXT NOT NULL,
-                response TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY(client_id, request_id)
-            );
-            PRAGMA user_version = 1;
-            """
-        )
+        if version == 0:
+            self._connection.executescript(
+                """
+                CREATE TABLE tasks (
+                    task_id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    task_name TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    save_root TEXT NOT NULL,
+                    workspace TEXT NOT NULL,
+                    final_path TEXT NOT NULL,
+                    overwrite_policy TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    speed_bps REAL NOT NULL DEFAULT 0,
+                    route TEXT NOT NULL DEFAULT '',
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    pause_requested INTEGER NOT NULL DEFAULT 0,
+                    auto_retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at TEXT,
+                    eta_seconds REAL
+                );
+                CREATE INDEX tasks_state_idx ON tasks(state);
+                CREATE UNIQUE INDEX tasks_active_output_idx ON tasks(final_path)
+                    WHERE state NOT IN ('completed', 'canceled', 'failed');
+                CREATE TABLE settings (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE idempotency (
+                    client_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    response TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(client_id, request_id)
+                );
+                PRAGMA user_version = 2;
+                """
+            )
+        elif version == 1:
+            self._connection.executescript(
+                """
+                ALTER TABLE tasks ADD COLUMN auto_retry_count INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE tasks ADD COLUMN next_retry_at TEXT;
+                ALTER TABLE tasks ADD COLUMN eta_seconds REAL;
+                PRAGMA user_version = 2;
+                """
+            )
         self._connection.commit()
 
     @contextmanager
@@ -116,8 +131,9 @@ class TaskRepository:
             INSERT INTO tasks (
                 task_id, url, task_name, filename, save_root, workspace, final_path,
                 overwrite_policy, state, completed, total, speed_bps, route, error,
-                created_at, updated_at, pause_requested
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, pause_requested, auto_retry_count,
+                next_retry_at, eta_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.task_id,
@@ -137,6 +153,9 @@ class TaskRepository:
                 record.created_at,
                 record.updated_at,
                 int(record.pause_requested),
+                record.auto_retry_count,
+                record.next_retry_at,
+                record.eta_seconds,
             ),
         )
         self._commit_if_needed()
@@ -178,6 +197,15 @@ class TaskRepository:
         for key in ("completed", "total", "speed_bps", "route", "error"):
             if key in payload:
                 updates[key] = payload[key]
+        if target is not TaskState.DOWNLOADING:
+            updates["eta_seconds"] = None
+        elif "eta_seconds" in payload:
+            value = payload["eta_seconds"]
+            updates["eta_seconds"] = (
+                float(value)
+                if type(value) in {int, float} and math.isfinite(float(value)) and float(value) >= 0
+                else None
+            )
         if target is TaskState.FAILED and "error" not in updates:
             updates["error"] = "下载任务失败"
         assignments = ", ".join(f"{key} = ?" for key in updates)
@@ -185,6 +213,55 @@ class TaskRepository:
             f"UPDATE tasks SET {assignments} WHERE task_id = ?",
             (*updates.values(), task_id),
         )
+        self._commit_if_needed()
+        return self.get_private(task_id)
+
+    def schedule_retry(self, task_id: str, next_retry_at: str) -> TaskRecord:
+        current = self.get_private(task_id)
+        if current.state is not TaskState.FAILED:
+            raise ValueError("只有失败任务可以安排自动重试")
+        self._connection.execute(
+            "UPDATE tasks SET auto_retry_count = auto_retry_count + 1, next_retry_at = ?, "
+            "eta_seconds = NULL, updated_at = ? WHERE task_id = ?",
+            (next_retry_at, _now(), task_id),
+        )
+        self._commit_if_needed()
+        return self.get_private(task_id)
+
+    def list_due_retries(self, now: str) -> list[TaskRecord]:
+        rows = self._connection.execute(
+            "SELECT * FROM tasks WHERE state = ? AND next_retry_at IS NOT NULL "
+            "AND next_retry_at <= ? ORDER BY created_at ASC, task_id ASC",
+            (TaskState.FAILED.value, now),
+        ).fetchall()
+        return [self._record_from_row(row) for row in rows]
+
+    def activate_scheduled_retry(self, task_id: str) -> TaskRecord:
+        current = self.get_private(task_id)
+        if current.state is not TaskState.FAILED or current.next_retry_at is None:
+            raise ValueError("任务没有待执行的自动重试")
+        validate_transition(current.state, TaskState.QUEUED)
+        self._connection.execute(
+            "UPDATE tasks SET state = ?, error = NULL, next_retry_at = NULL, "
+            "eta_seconds = NULL, updated_at = ? WHERE task_id = ?",
+            (TaskState.QUEUED.value, _now(), task_id),
+        )
+        self._commit_if_needed()
+        return self.get_private(task_id)
+
+    def clear_retry_schedule(self, task_id: str, *, reset_count: bool = False) -> TaskRecord:
+        self.get_private(task_id)
+        if reset_count:
+            self._connection.execute(
+                "UPDATE tasks SET auto_retry_count = 0, next_retry_at = NULL, "
+                "eta_seconds = NULL, updated_at = ? WHERE task_id = ?",
+                (_now(), task_id),
+            )
+        else:
+            self._connection.execute(
+                "UPDATE tasks SET next_retry_at = NULL, eta_seconds = NULL, updated_at = ? WHERE task_id = ?",
+                (_now(), task_id),
+            )
         self._commit_if_needed()
         return self.get_private(task_id)
 
@@ -272,6 +349,9 @@ class TaskRepository:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             pause_requested=bool(row["pause_requested"]),
+            auto_retry_count=row["auto_retry_count"],
+            next_retry_at=row["next_retry_at"],
+            eta_seconds=row["eta_seconds"],
         )
 
 

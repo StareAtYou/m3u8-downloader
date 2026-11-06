@@ -1,4 +1,6 @@
+import math
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -24,11 +26,98 @@ def test_creates_schema_and_round_trips_private_and_public_records(tmp_path: Pat
     repository = TaskRepository(tmp_path / "tasks.sqlite3")
     created = create_task(repository)
 
-    assert repository.schema_version == 1
+    assert repository.schema_version == 2
     assert repository.get_private(created.task_id).url.endswith("token=private")
     assert repository.get_snapshot(created.task_id).redacted_url.endswith("token=%2A%2A%2A")
+    assert repository.get_snapshot(created.task_id).auto_retry_count == 0
+    assert repository.get_snapshot(created.task_id).next_retry_at is None
+    assert repository.get_snapshot(created.task_id).eta_seconds is None
     if os.name != "nt":
         assert (tmp_path / "tasks.sqlite3").stat().st_mode & 0o077 == 0
+
+
+def test_migrates_v1_database_without_losing_existing_task(tmp_path: Path) -> None:
+    database = tmp_path / "tasks.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY, url TEXT NOT NULL, task_name TEXT NOT NULL,
+            filename TEXT NOT NULL, save_root TEXT NOT NULL, workspace TEXT NOT NULL,
+            final_path TEXT NOT NULL, overwrite_policy TEXT NOT NULL, state TEXT NOT NULL,
+            completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
+            speed_bps REAL NOT NULL DEFAULT 0, route TEXT NOT NULL DEFAULT '', error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            pause_requested INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX tasks_state_idx ON tasks(state);
+        CREATE UNIQUE INDEX tasks_active_output_idx ON tasks(final_path)
+            WHERE state NOT IN ('completed', 'canceled', 'failed');
+        CREATE TABLE settings (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), value TEXT NOT NULL);
+        CREATE TABLE idempotency (
+            client_id TEXT NOT NULL, request_id TEXT NOT NULL, response TEXT NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(client_id, request_id)
+        );
+        INSERT INTO tasks VALUES (
+            'legacy', 'https://example/legacy.m3u8?token=private', 'Legacy', 'Legacy.mp4',
+            '/videos', '/work/legacy', '/videos/Legacy/Legacy.mp4', 'reject', 'failed',
+            3, 10, 512.0, '直连', '旧错误',
+            '2026-11-01T00:00:00+00:00', '2026-11-01T01:00:00+00:00', 0
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    repository = TaskRepository(database)
+    migrated = repository.get_private("legacy")
+
+    assert repository.schema_version == 2
+    assert migrated.url.endswith("token=private")
+    assert migrated.state is TaskState.FAILED
+    assert (migrated.completed, migrated.total, migrated.error) == (3, 10, "旧错误")
+    assert (migrated.auto_retry_count, migrated.next_retry_at, migrated.eta_seconds) == (0, None, None)
+
+
+def test_retry_metadata_orders_due_tasks_and_can_activate_or_reset(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    first = create_task(repository, "task-a")
+    second = create_task(repository, "task-b")
+    repository._connection.execute("UPDATE tasks SET created_at = ?", ("2026-11-01T00:00:00+00:00",))
+    repository._connection.commit()
+    for task in (first, second):
+        repository.update_state(task.task_id, TaskState.FAILED, error="temporary")
+    repository.schedule_retry(second.task_id, "2026-11-06T12:00:00+00:00")
+    repository.schedule_retry(first.task_id, "2026-11-06T12:00:00+00:00")
+
+    assert [item.task_id for item in repository.list_due_retries("2026-11-06T12:00:00+00:00")] == [
+        first.task_id,
+        second.task_id,
+    ]
+    activated = repository.activate_scheduled_retry(first.task_id)
+    assert activated.state is TaskState.QUEUED
+    assert activated.auto_retry_count == 1
+    assert activated.next_retry_at is None
+    assert activated.error is None
+
+    reset = repository.clear_retry_schedule(second.task_id, reset_count=True)
+    assert reset.state is TaskState.FAILED
+    assert reset.auto_retry_count == 0
+    assert reset.next_retry_at is None
+
+
+def test_worker_eta_persists_only_finite_non_negative_values(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "tasks.sqlite3")
+    task = create_task(repository)
+    repository.apply_worker_event(task.task_id, TaskState.PROBING, {})
+    repository.apply_worker_event(task.task_id, TaskState.PARSING, {})
+    repository.apply_worker_event(task.task_id, TaskState.DOWNLOADING, {"eta_seconds": 12.5})
+    assert repository.get_snapshot(task.task_id).eta_seconds == 12.5
+
+    for invalid in (-1, math.nan, math.inf, "soon", True):
+        repository.apply_worker_event(task.task_id, TaskState.DOWNLOADING, {"eta_seconds": invalid})
+        assert repository.get_snapshot(task.task_id).eta_seconds is None
 
 
 def test_rolls_back_explicit_transaction(tmp_path: Path) -> None:
