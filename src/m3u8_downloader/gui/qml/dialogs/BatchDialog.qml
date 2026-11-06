@@ -6,8 +6,6 @@ import "../theme" as AppTheme
 
 Dialog {
     id: dialog
-    property string saveRoot: ""
-    property bool overwrite: false
     title: "批量添加任务"
     modal: true
     width: Math.min(620, Overlay.overlay ? Overlay.overlay.width - 48 : 620)
@@ -60,7 +58,7 @@ Dialog {
                         let parts = lines[i].split("|")
                         tasks.push({"url": parts[0] ? parts[0].trim() : "", "task_name": parts[1] ? parts[1].trim() : ""})
                     }
-                    bridge.submitBatch(tasks, dialog.saveRoot, dialog.overwrite)
+                    bridge.submitBatch(tasks)
                 }
             }
         }

@@ -4,7 +4,6 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QUrl
-from PySide6.QtTest import QSignalSpy
 
 from m3u8_downloader.gui.bridge import AppBridge, ensure_service_running
 
@@ -31,7 +30,14 @@ class Client:
         if action == "list":
             return {"tasks": self.list_tasks}
         if action == "get_settings":
-            return {"settings": {"default_save_dir": "/tmp", "max_active_tasks": 3, "close_behavior": "shutdown"}}
+            return {
+                "settings": {
+                    "default_save_dir": "/tmp",
+                    "max_active_tasks": 3,
+                    "close_behavior": "shutdown",
+                    "overwrite_existing": True,
+                }
+            }
         if action == "update_settings":
             return {"settings": payload}
         if action == "submit":
@@ -91,13 +97,43 @@ def test_preview_submit_overwrite_controls_and_settings_are_async(qtbot) -> None
     bridge = AppBridge(client)
     assert bridge.previewFilename("Bad:/Name") == "Bad__Name.mp4"
 
-    spy = QSignalSpy(bridge.requestSucceeded)
-    bridge.submitTask("https://example/a.m3u8", "Movie", "/tmp", True)
-    qtbot.waitUntil(lambda: spy.count() > 0, timeout=1000)
+    bridge.loadSettings()
+    qtbot.waitUntil(lambda: bridge.defaultSaveDir == "/tmp" and bridge.overwriteExisting is True)
+    bridge.submitTask("https://example/a.m3u8", "Movie")
+    qtbot.waitUntil(lambda: client.calls[-1][0] == "submit", timeout=1000)
     assert client.calls[-1] == (
         "submit",
         {"url": "https://example/a.m3u8", "task_name": "Movie", "save_root": "/tmp", "overwrite": True},
     )
+
+    assert bridge.submitBatch([{"url": "https://example/b.m3u8", "task_name": "Episode"}]) is True
+    qtbot.waitUntil(lambda: client.calls[-1][0] == "submit_batch")
+    assert client.calls[-1] == (
+        "submit_batch",
+        {
+            "tasks": [
+                {
+                    "url": "https://example/b.m3u8",
+                    "task_name": "Episode",
+                    "save_root": "/tmp",
+                    "overwrite": True,
+                }
+            ]
+        },
+    )
+
+    bridge._apply_result(
+        "get_settings",
+        {"settings": {"default_save_dir": "/videos", "overwrite_existing": False}},
+    )
+    bridge.submitTaskWithOverwrite("https://example/override.m3u8", "Override")
+    qtbot.waitUntil(lambda: client.calls[-1][0] == "submit")
+    assert client.calls[-1][1] == {
+        "url": "https://example/override.m3u8",
+        "task_name": "Override",
+        "save_root": "/videos",
+        "overwrite": True,
+    }
 
     bridge.controlTask("pause", "task-1")
     qtbot.waitUntil(lambda: client.calls[-1][0] == "pause")
@@ -109,14 +145,6 @@ def test_preview_submit_overwrite_controls_and_settings_are_async(qtbot) -> None
     qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "task-1", "delete_files": False}))
     bridge.deleteTask("task-2", True)
     qtbot.waitUntil(lambda: client.calls[-1] == ("delete_task", {"task_id": "task-2", "delete_files": True}))
-    bridge.loadSettings()
-    qtbot.waitUntil(
-        lambda: (
-            client.calls[-1][0] == "get_settings"
-            and bridge.defaultSaveDir == "/tmp"
-            and bridge.closeBehavior == "shutdown"
-        )
-    )
     bridge.saveSettings({"default_save_dir": "/videos", "max_active_tasks": 2})
     qtbot.waitUntil(lambda: client.calls[-1][0] == "update_settings")
     bridge.close()

@@ -41,14 +41,22 @@ def test_main_qml_loads_offscreen_without_warnings_and_has_exact_composer_copy(q
     for name, text in (
         ("urlLabel", "M3U8 地址"),
         ("taskNameLabel", "任务名称"),
-        ("saveToLabel", "保存到"),
         ("addTaskButton", "添加任务"),
         ("batchAddButton", "批量添加"),
-        ("outputPreview", "输出：风起长安 第03集.mp4"),
+        ("outputPreview", "输出：请输入有效任务名称"),
     ):
         item = root.findChild(object, name)
         assert item is not None, name
         assert item.property("text") == text
+    url_input = named(root, "urlInput")
+    task_name = named(root, "taskNameInput")
+    assert url_input.property("text") == task_name.property("text") == ""
+    assert url_input.property("placeholderText")
+    assert task_name.property("placeholderText")
+    assert root.findChild(object, "saveToLabel") is None
+    assert root.findChild(object, "saveInput") is None
+    assert root.findChild(object, "overwriteCheck") is None
+    assert root.findChild(object, "saveFolderDialog") is None
     bridge.close()
     del engine
 
@@ -59,26 +67,51 @@ def test_single_submit_success_clears_transient_fields_and_failure_preserves_the
         assert warnings == []
         url_input = named(root, "urlInput")
         task_name = named(root, "taskNameInput")
-        save_input = named(root, "saveInput")
-        overwrite = named(root, "overwriteCheck")
         url_input.setProperty("text", "https://cdn.example.com/episode.m3u8")
         task_name.setProperty("text", "第 12 集")
-        save_input.setProperty("text", "/tmp/连续剧")
-        overwrite.setProperty("checked", True)
 
         bridge.requestFailed.emit("submit", "网络错误")
         qtbot.wait(20)
         assert url_input.property("text") == "https://cdn.example.com/episode.m3u8"
         assert task_name.property("text") == "第 12 集"
-        assert save_input.property("text") == "/tmp/连续剧"
-        assert overwrite.property("checked") is True
 
         bridge.requestSucceeded.emit("submit", {"tasks": []})
         qtbot.wait(20)
         assert url_input.property("text") == ""
         assert task_name.property("text") == ""
-        assert save_input.property("text") == "/tmp/连续剧"
-        assert overwrite.property("checked") is False
+    finally:
+        bridge.close()
+        del engine
+
+
+def test_single_task_conflict_keeps_one_off_overwrite_confirmation(qtbot) -> None:
+    engine, root, bridge, warnings = load_qml(qtbot)
+    try:
+        assert warnings == []
+        named(root, "urlInput").setProperty("text", "https://cdn.example.com/episode.m3u8")
+        named(root, "taskNameInput").setProperty("text", "第 12 集")
+        assert QMetaObject.invokeMethod(named(root, "addTaskButton"), "clicked")
+        qtbot.waitUntil(lambda: bridge.client.calls[-1][0] == "submit")
+
+        bridge.requestFailed.emit("submit", "目标文件已存在")
+        conflict = root.findChild(object, "overwriteConflictDialog")
+        assert conflict is not None
+        qtbot.waitUntil(lambda: conflict.property("visible") is True)
+        assert QMetaObject.invokeMethod(named(root, "confirmOverwriteButton"), "clicked")
+        qtbot.waitUntil(
+            lambda: (
+                bridge.client.calls[-1]
+                == (
+                    "submit",
+                    {
+                        "url": "https://cdn.example.com/episode.m3u8",
+                        "task_name": "第 12 集",
+                        "save_root": bridge.defaultSaveDir,
+                        "overwrite": True,
+                    },
+                )
+            )
+        )
     finally:
         bridge.close()
         del engine
@@ -111,12 +144,10 @@ def test_table_contract_responsive_columns_controls_and_navigation(qtbot) -> Non
     assert "KeyNavigation.tab" in source
     assert "selectedTask" in source
     assert "风起长安 第02集" not in source
-    assert "overwriteCheck.checked" in (QML_ROOT / "Main.qml").read_text()
     assert "close.accepted = false" in (QML_ROOT / "Main.qml").read_text()
     assert root.findChild(object, "errorDialog") is not None
     assert root.findChild(object, "overwriteConflictDialog") is not None
-    overwrite = root.findChild(object, "overwriteCheck")
-    assert overwrite.property("visible") is True
+    assert root.findChild(object, "overwriteCheck") is None
     bridge.close()
     del engine
 
@@ -161,23 +192,29 @@ def test_bulk_controls_and_delete_dialog_send_exact_service_requests(qtbot) -> N
         del engine
 
 
-def test_batch_validation_is_all_or_nothing_and_overwrite_maps_to_payload(qtbot) -> None:
+def test_batch_validation_is_all_or_nothing_and_uses_bridge_settings(qtbot) -> None:
     client = StaticClient()
     bridge = AppBridge(client)
     failures = []
     bridge.requestFailed.connect(lambda action, message: failures.append((action, message)))
-    assert bridge.submitBatch([{"url": "https://e/a.m3u8", "task_name": ""}], "/tmp", False) is False
+    assert bridge.submitBatch([{"url": "https://e/a.m3u8", "task_name": ""}]) is False
     assert failures and failures[0][0] == "submit_batch"
     bridge.close()
 
 
-def test_settings_exposes_default_directory_manual_proxy_and_ffmpeg() -> None:
-    source = (QML_ROOT / "pages" / "SettingsPage.qml").read_text()
-    assert "defaultSaveDir" in source
-    assert "manualProxy" in source
-    assert "ffmpegPath" in source
-    assert "onSettingsLoaded" in source
-    assert "close_behavior" in source
+def test_settings_exposes_default_directory_overwrite_manual_proxy_and_ffmpeg(qtbot) -> None:
+    engine, root, bridge, warnings = load_qml(qtbot)
+    try:
+        assert warnings == []
+        root.setProperty("currentPage", 2)
+        qtbot.wait(20)
+        assert named(root, "defaultSaveDir") is not None
+        assert named(root, "overwriteExistingCheck") is not None
+        assert named(root, "manualProxy") is not None
+        assert named(root, "ffmpegPath") is not None
+    finally:
+        bridge.close()
+        del engine
 
 
 def test_completed_page_renders_completed_model_rows() -> None:
@@ -193,16 +230,15 @@ def test_desktop_composer_alignment_preview_and_completed_badge(qtbot) -> None:
     assert warnings == []
     assert root.property("compactLayout") is False
 
-    labels = [named(root, name) for name in ("urlLabel", "taskNameLabel", "saveToLabel")]
-    fields = [named(root, name) for name in ("urlInput", "taskNameInput", "saveInput")]
+    labels = [named(root, name) for name in ("urlLabel", "taskNameLabel")]
+    fields = [named(root, name) for name in ("urlInput", "taskNameInput")]
     buttons = [named(root, name) for name in ("addTaskButton", "batchAddButton")]
     assert len({round(scene_position(item).y()) for item in labels}) == 1
     assert len({round(scene_position(item).y()) for item in fields}) == 1
     assert {round(scene_position(item).y()) for item in buttons} == {round(scene_position(fields[0]).y())}
 
     preview = named(root, "outputPreview")
-    overwrite = named(root, "overwriteCheck")
-    assert round(scene_position(preview).y()) == round(scene_position(overwrite).y())
+    assert scene_position(preview).y() > scene_position(fields[1]).y()
     task_name = fields[1]
     task_name.setProperty("text", "Bad:/Name")
     qtbot.wait(20)
@@ -227,26 +263,20 @@ def test_compact_composer_reflows_inside_bounds_and_keeps_tab_order(qtbot) -> No
 
         url_input = named(root, "urlInput")
         task_name = named(root, "taskNameInput")
-        save_input = named(root, "saveInput")
         add_button = named(root, "addTaskButton")
         batch_button = named(root, "batchAddButton")
-        assert scene_position(save_input).y() > scene_position(url_input).y()
-        assert round(scene_position(add_button).y()) == round(scene_position(save_input).y())
-        for item in (url_input, task_name, save_input, add_button, batch_button):
+        assert scene_position(add_button).y() > scene_position(url_input).y()
+        assert round(scene_position(add_button).y()) == round(scene_position(batch_button).y())
+        for item in (url_input, task_name, add_button, batch_button):
             pos = scene_position(item)
             assert pos.x() >= 208
             assert pos.x() + item.property("width") <= width
 
-        folder_button = save_input.findChild(QQuickItem, "trailingAction")
-        assert folder_button is not None
         expected = [
             url_input,
             task_name,
-            save_input,
-            folder_button,
             add_button,
             batch_button,
-            named(root, "overwriteCheck"),
             named(root, "downloadsNavigation"),
             named(root, "completedNavigation"),
             named(root, "settingsNavigation"),
@@ -314,6 +344,7 @@ def test_settings_keyboard_focus_is_scrolled_into_view_in_both_directions(qtbot)
         named(root, name)
         for name in (
             "defaultSaveDir",
+            "overwriteExistingCheck",
             "closeBehavior",
             "activeTasks",
             "segmentThreads",

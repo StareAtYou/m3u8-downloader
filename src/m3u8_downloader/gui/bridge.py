@@ -30,6 +30,7 @@ class AppBridge(QObject):
     requestFailed = Signal(str, str)
     settingsLoaded = Signal(object)
     defaultSaveDirChanged = Signal()
+    overwriteExistingChanged = Signal()
     closeBehaviorChanged = Signal()
     connectionStateChanged = Signal(bool)
     _eventReceived = Signal(object)
@@ -42,6 +43,7 @@ class AppBridge(QObject):
         self.client = client
         self._tasks = TaskListModel(self)
         self._default_save_dir = str(Path.home() / "Downloads")
+        self._overwrite_existing = False
         self._close_behavior = "tray"
         self._subscription = None
         self._closing = threading.Event()
@@ -61,6 +63,10 @@ class AppBridge(QObject):
     @Property(str, notify=defaultSaveDirChanged)
     def defaultSaveDir(self) -> str:
         return self._default_save_dir
+
+    @Property(bool, notify=overwriteExistingChanged)
+    def overwriteExisting(self) -> bool:
+        return self._overwrite_existing
 
     @Property(str, notify=closeBehaviorChanged)
     def closeBehavior(self) -> str:
@@ -160,6 +166,10 @@ class AppBridge(QObject):
                 if default_dir != self._default_save_dir:
                     self._default_save_dir = default_dir
                     self.defaultSaveDirChanged.emit()
+                overwrite_existing = settings.get("overwrite_existing", self._overwrite_existing)
+                if type(overwrite_existing) is bool and overwrite_existing != self._overwrite_existing:
+                    self._overwrite_existing = overwrite_existing
+                    self.overwriteExistingChanged.emit()
                 close_behavior = str(settings.get("close_behavior") or self._close_behavior)
                 if close_behavior != self._close_behavior:
                     self._close_behavior = close_behavior
@@ -172,6 +182,10 @@ class AppBridge(QObject):
                 if default_dir != self._default_save_dir:
                     self._default_save_dir = default_dir
                     self.defaultSaveDirChanged.emit()
+                overwrite_existing = settings.get("overwrite_existing", self._overwrite_existing)
+                if type(overwrite_existing) is bool and overwrite_existing != self._overwrite_existing:
+                    self._overwrite_existing = overwrite_existing
+                    self.overwriteExistingChanged.emit()
                 close_behavior = str(settings.get("close_behavior") or self._close_behavior)
                 if close_behavior != self._close_behavior:
                     self._close_behavior = close_behavior
@@ -199,15 +213,27 @@ class AppBridge(QObject):
     def copyText(self, text: str) -> None:
         self._clipboard_writer(text)
 
-    @Slot(str, str, str, bool)
-    def submitTask(self, url: str, task_name: str, save_root: str, overwrite: bool) -> None:
+    def _submit_task(self, url: str, task_name: str, *, overwrite: bool) -> None:
         self._request(
             "submit",
-            {"url": url, "task_name": task_name, "save_root": save_root, "overwrite": overwrite},
+            {
+                "url": url,
+                "task_name": task_name,
+                "save_root": self._default_save_dir,
+                "overwrite": overwrite,
+            },
         )
 
-    @Slot("QVariantList", str, bool, result=bool)
-    def submitBatch(self, tasks: list[Any], save_root: str, overwrite: bool) -> bool:
+    @Slot(str, str)
+    def submitTask(self, url: str, task_name: str) -> None:
+        self._submit_task(url, task_name, overwrite=self._overwrite_existing)
+
+    @Slot(str, str)
+    def submitTaskWithOverwrite(self, url: str, task_name: str) -> None:
+        self._submit_task(url, task_name, overwrite=True)
+
+    @Slot("QVariantList", result=bool)
+    def submitBatch(self, tasks: list[Any]) -> bool:
         prepared = []
         try:
             for task in tasks:
@@ -217,7 +243,14 @@ class AppBridge(QObject):
                 name = sanitize_task_name(str(task.get("task_name", "")))
                 if not url:
                     raise ValueError("批量任务 URL 不能为空")
-                prepared.append({"url": url, "task_name": name, "save_root": save_root, "overwrite": overwrite})
+                prepared.append(
+                    {
+                        "url": url,
+                        "task_name": name,
+                        "save_root": self._default_save_dir,
+                        "overwrite": self._overwrite_existing,
+                    }
+                )
         except (TypeError, ValueError) as exc:
             self.requestFailed.emit("submit_batch", str(exc))
             return False
