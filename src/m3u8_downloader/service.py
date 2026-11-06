@@ -156,7 +156,13 @@ class ServiceServer:
                 with self._subscribers_lock:
                     self._subscribers.add(connection)
                 return
-            result = self._dispatch(request)
+            try:
+                result = self._dispatch(request)
+            except OSError as exc:
+                raise ProtocolError(
+                    "filesystem_error",
+                    "本地文件操作失败，请检查文件占用或目录权限后重试",
+                ) from exc
             send_frame(connection, ResponseFrame.success(request_id, result))
             if request.action not in {"ping", "list", "get", "get_settings"}:
                 self.broadcast_tasks()

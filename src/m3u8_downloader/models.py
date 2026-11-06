@@ -66,8 +66,12 @@ class AppSettings:
     close_behavior: str = "tray"
 
     def validate(self) -> AppSettings:
+        if type(self.max_active_tasks) is not int:
+            raise ValueError("同时下载任务数必须是整数")
         if not 1 <= self.max_active_tasks <= 16:
             raise ValueError("同时下载任务数必须在 1 到 16 之间")
+        if type(self.segment_threads) is not int:
+            raise ValueError("分片线程数必须是整数")
         if not 1 <= self.segment_threads <= 64:
             raise ValueError("分片线程数必须在 1 到 64 之间")
         if self.proxy_policy not in {"auto", "direct", "manual"}:

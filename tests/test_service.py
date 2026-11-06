@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from m3u8_downloader import service
-from m3u8_downloader.ipc_client import ServiceClient
+from m3u8_downloader.ipc_client import ServiceClient, ServiceError
 from m3u8_downloader.manager import TaskManager
 from m3u8_downloader.models import OverwritePolicy, TaskState
 from m3u8_downloader.service import (
@@ -98,6 +98,24 @@ def test_command_dispatch_correlation_and_persistent_idempotency(tmp_path: Path)
         assert reopened.list() == []
     finally:
         stop_server(server2, thread2)
+
+
+def test_delete_permission_error_is_returned_as_actionable_service_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = make_manager(tmp_path)
+
+    def deny_delete(task_id: str, *, delete_files: bool = False):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(manager, "delete", deny_delete)
+    server, thread, key = start_server(tmp_path, manager)
+    try:
+        with pytest.raises(ServiceError, match="文件占用或目录权限") as caught:
+            ServiceClient(server.address, key).request("delete_task", {"task_id": "blocked", "delete_files": True})
+        assert caught.value.code == "filesystem_error"
+    finally:
+        stop_server(server, thread)
 
 
 def test_batch_dedup_is_atomic_under_two_simultaneous_clients(tmp_path: Path) -> None:

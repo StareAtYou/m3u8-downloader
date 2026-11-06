@@ -276,26 +276,33 @@ class TaskManager:
         return paused
 
     def resume_all(self) -> list[str]:
-        resumed = []
-        for snapshot in self.list():
-            if snapshot.state is TaskState.PAUSED:
-                self.resume(snapshot.task_id)
-                resumed.append(snapshot.task_id)
-        return resumed
+        with self._lock:
+            paused = [
+                snapshot
+                for snapshot in self.repository.list_snapshots(newest_first=False)
+                if snapshot.state is TaskState.PAUSED
+            ]
+            for snapshot in paused:
+                self._resume_locked(snapshot.task_id)
+            self._schedule_locked()
+            return [snapshot.task_id for snapshot in paused]
 
     def resume(self, task_id: str) -> TaskSnapshot:
         with self._lock:
-            record = self.repository.get_private(task_id)
-            if record.state is not TaskState.PAUSED:
-                raise ValueError("只有暂停的任务可以继续")
-            self.repository.set_pause_requested(task_id, False)
-            running = self._running.get(task_id)
-            if running is not None:
-                running.control.resume()
-                running.resume_after_pause = True
-            result = self.repository.update_state(task_id, TaskState.QUEUED).to_snapshot()
+            result = self._resume_locked(task_id)
             self._schedule_locked()
             return result
+
+    def _resume_locked(self, task_id: str) -> TaskSnapshot:
+        record = self.repository.get_private(task_id)
+        if record.state is not TaskState.PAUSED:
+            raise ValueError("只有暂停的任务可以继续")
+        self.repository.set_pause_requested(task_id, False)
+        running = self._running.get(task_id)
+        if running is not None:
+            running.control.resume()
+            running.resume_after_pause = True
+        return self.repository.update_state(task_id, TaskState.QUEUED).to_snapshot()
 
     def cancel(self, task_id: str) -> TaskSnapshot:
         with self._lock:

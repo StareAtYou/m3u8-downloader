@@ -393,6 +393,47 @@ def test_disabled_auto_schedule_stays_disabled_after_resume(tmp_path: Path) -> N
     assert instance.get(task.task_id).state is TaskState.QUEUED
 
 
+def test_resume_all_schedules_oldest_paused_task_first(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=1))
+    oldest = repository.create_task(
+        task_id="oldest",
+        url="https://example/oldest.m3u8",
+        task_name="Oldest",
+        filename="Oldest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "oldest"),
+        final_path=str(tmp_path / "Oldest" / "Oldest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    newest = repository.create_task(
+        task_id="newest",
+        url="https://example/newest.m3u8",
+        task_name="Newest",
+        filename="Newest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "newest"),
+        final_path=str(tmp_path / "Newest" / "Newest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    repository.update_state(oldest.task_id, TaskState.PAUSED)
+    repository.update_state(newest.task_id, TaskState.PAUSED)
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+    )
+
+    resumed = instance.resume_all()
+
+    assert resumed == [oldest.task_id, newest.task_id]
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+    assert instance.get(newest.task_id).state is TaskState.QUEUED
+
+
 def test_pause_all_skips_merging_resume_all_starts_only_paused_and_part_files_do_not_count(
     tmp_path: Path,
 ) -> None:

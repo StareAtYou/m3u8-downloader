@@ -57,6 +57,34 @@ def test_json_settings_store_migrates_fallback_once_and_surfaces_corruption_with
     assert path.read_bytes() == corrupt
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_active_tasks", 2.5),
+        ("max_active_tasks", True),
+        ("segment_threads", 4.5),
+        ("segment_threads", False),
+    ],
+)
+def test_json_settings_store_rejects_non_integer_concurrency_values(tmp_path: Path, field: str, value: object) -> None:
+    path = tmp_path / "settings.json"
+    payload = {
+        "default_save_dir": "",
+        "max_active_tasks": 3,
+        "segment_threads": 16,
+        "proxy_policy": "auto",
+        "manual_proxy": None,
+        "ffmpeg_path": "ffmpeg",
+        "theme": "dark",
+        "close_behavior": "tray",
+    }
+    payload[field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="设置文件内容无效"):
+        JsonSettingsStore(path).get_settings()
+
+
 def test_failed_atomic_replace_keeps_previous_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "settings.json"
     original = AppSettings(max_active_tasks=2)
