@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -50,7 +51,18 @@ class Launcher:
         return process
 
 
-def manager(tmp_path: Path, *, max_active: int = 3):
+class FakeClock:
+    def __init__(self, value: datetime | None = None) -> None:
+        self.value = value or datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+def manager(tmp_path: Path, *, max_active: int = 3, clock: FakeClock | None = None):
     repository = TaskRepository(tmp_path / "state.sqlite3")
     repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=max_active))
     launcher = Launcher()
@@ -61,8 +73,26 @@ def manager(tmp_path: Path, *, max_active: int = 3):
         process_launcher=launcher,
         event_queue=events,
         merge_lock=threading.Lock(),
+        **({"clock": clock} if clock is not None else {}),
     )
     return instance, repository, launcher, events
+
+
+def _fail_running_task(
+    instance: TaskManager,
+    repository: TaskRepository,
+    launcher: Launcher,
+    events: queue.Queue,
+    task_id: str,
+    *,
+    error_type: str = "RuntimeError",
+) -> None:
+    events.put(WorkerEvent(task_id, TaskState.FAILED, {"error": "temporary", "error_type": error_type}))
+    process = next(item for item in reversed(launcher.processes) if item.task_id == task_id and item.alive)
+    process.alive = False
+    process.exitcode = 1
+    instance.drain_worker_events()
+    assert repository.get_snapshot(task_id).state is TaskState.FAILED
 
 
 def test_submission_validates_name_url_path_and_explicit_overwrite(tmp_path: Path) -> None:
@@ -197,6 +227,148 @@ def test_newest_first_display_keeps_oldest_first_scheduler(tmp_path: Path) -> No
     instance.drain_worker_events()
 
     assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id, tasks[1].task_id]
+
+
+def test_automatic_retry_uses_three_persisted_backoff_delays_then_stops(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/retry.m3u8", "Retry", tmp_path)
+    expected_delays = (2, 5, 10)
+
+    for attempt, delay in enumerate(expected_delays, start=1):
+        _fail_running_task(instance, repository, launcher, events, task.task_id)
+        waiting = repository.get_snapshot(task.task_id)
+        assert waiting.auto_retry_count == attempt
+        assert waiting.next_retry_at == (clock.value + timedelta(seconds=delay)).isoformat()
+        instance.drain_worker_events()
+        assert len(launcher.specs) == attempt
+        clock.advance(delay)
+        instance.drain_worker_events()
+        assert len(launcher.specs) == attempt + 1
+
+    _fail_running_task(instance, repository, launcher, events, task.task_id)
+    exhausted = repository.get_snapshot(task.task_id)
+    assert exhausted.auto_retry_count == 3
+    assert exhausted.next_retry_at is None
+    clock.advance(60)
+    instance.drain_worker_events()
+    assert len(launcher.specs) == 4
+
+
+def test_automatic_retry_skips_file_conflict_and_manual_retry_resets_budget(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    conflict = instance.submit("https://example/conflict.m3u8", "Conflict", tmp_path)
+    _fail_running_task(
+        instance,
+        repository,
+        launcher,
+        events,
+        conflict.task_id,
+        error_type="FileExistsError",
+    )
+    assert repository.get_snapshot(conflict.task_id).auto_retry_count == 0
+    assert repository.get_snapshot(conflict.task_id).next_retry_at is None
+
+    instance.retry(conflict.task_id)
+    _fail_running_task(instance, repository, launcher, events, conflict.task_id)
+    assert repository.get_snapshot(conflict.task_id).auto_retry_count == 1
+    instance.retry(conflict.task_id)
+    reset = repository.get_snapshot(conflict.task_id)
+    assert reset.state is TaskState.QUEUED
+    assert reset.auto_retry_count == 0
+    assert reset.next_retry_at is None
+
+
+def test_due_retries_survive_restart_and_keep_fifo_limit(tmp_path: Path) -> None:
+    clock = FakeClock()
+    database = tmp_path / "state.sqlite3"
+    first_repository = TaskRepository(database)
+    first_repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=1))
+    oldest = first_repository.create_task(
+        task_id="oldest",
+        url="https://example/oldest.m3u8",
+        task_name="Oldest",
+        filename="Oldest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "oldest"),
+        final_path=str(tmp_path / "Oldest" / "Oldest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    newest = first_repository.create_task(
+        task_id="newest",
+        url="https://example/newest.m3u8",
+        task_name="Newest",
+        filename="Newest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "newest"),
+        final_path=str(tmp_path / "Newest" / "Newest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    first_repository._connection.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-11-01T00:00:00+00:00", oldest.task_id),
+    )
+    first_repository._connection.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-11-02T00:00:00+00:00", newest.task_id),
+    )
+    first_repository._connection.commit()
+    for task in (oldest, newest):
+        first_repository.update_state(task.task_id, TaskState.FAILED, error="temporary")
+        first_repository.schedule_retry(task.task_id, (clock.value + timedelta(seconds=2)).isoformat())
+    first_repository.close()
+
+    clock.advance(2)
+    repository = TaskRepository(database)
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+        clock=clock,
+    )
+
+    changed = instance.drain_worker_events()
+
+    assert changed == 2
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+    assert repository.get_snapshot(oldest.task_id).auto_retry_count == 1
+    assert repository.get_snapshot(newest.task_id).state is TaskState.QUEUED
+    instance.drain_worker_events()
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+
+
+def test_resume_all_keeps_retry_deadline_and_does_not_launch_early(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/retry.m3u8", "Retry", tmp_path)
+    _fail_running_task(instance, repository, launcher, events, task.task_id)
+    deadline = repository.get_snapshot(task.task_id).next_retry_at
+
+    assert instance.resume_all() == []
+    assert repository.get_snapshot(task.task_id).next_retry_at == deadline
+    assert len(launcher.specs) == 1
+
+
+def test_automatic_retry_stops_when_output_was_reserved_by_a_new_task(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    original = instance.submit("https://example/original.m3u8", "Same", tmp_path)
+    _fail_running_task(instance, repository, launcher, events, original.task_id)
+    replacement = instance.submit("https://example/replacement.m3u8", "Same", tmp_path)
+
+    clock.advance(2)
+    changed = instance.drain_worker_events()
+
+    blocked = repository.get_snapshot(original.task_id)
+    assert changed == 1
+    assert blocked.state is TaskState.FAILED
+    assert blocked.next_retry_at is None
+    assert blocked.error == "输出路径已被另一个活动任务占用，自动重试已停止"
+    assert [spec.task_id for spec in launcher.specs] == [original.task_id, replacement.task_id]
 
 
 def test_delete_record_only_preserves_files_and_active_worker_is_rejected(tmp_path: Path) -> None:

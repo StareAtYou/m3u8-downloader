@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,6 +22,8 @@ from .naming import build_output_paths
 from .settings_store import SettingsStore
 from .storage import TaskRepository
 from .worker import DownloadTaskSpec, WorkerEvent, run_download_task
+
+AUTO_RETRY_DELAYS = (2, 5, 10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +102,7 @@ class TaskManager:
         merge_lock: Any | None = None,
         process_context: Any | None = None,
         auto_schedule: bool = True,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.settings_store = settings_store or repository
@@ -108,6 +112,7 @@ class TaskManager:
         self.merge_lock = merge_lock or self._context.Lock()
         self._process_launcher = process_launcher or self._launch_process
         self._auto_schedule = auto_schedule
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._running: dict[str, _RunningTask] = {}
         self.controls: dict[str, Any] = {}
@@ -341,6 +346,7 @@ class TaskManager:
                 [{"final_path": record.final_path}],
                 exclude_task_ids=frozenset({task_id}),
             )
+            self.repository.clear_retry_schedule(task_id, reset_count=True)
             result = self.repository.update_state(task_id, TaskState.QUEUED).to_snapshot()
             self._schedule_locked()
             return result
@@ -442,10 +448,29 @@ class TaskManager:
                 self._running.pop(snapshot.task_id, None)
                 self.controls.pop(snapshot.task_id, None)
                 self.repository.update_state(snapshot.task_id, TaskState.FAILED, error="无法启动下载进程")
+                self._schedule_retry_after_failure_locked(snapshot.task_id, "ProcessStartError")
 
     def drain_worker_events(self) -> int:
-        drained = 0
+        changed = 0
         with self._lock:
+            now = self._clock().astimezone(UTC).isoformat()
+            for record in self.repository.list_due_retries(now):
+                if record.task_id in self._running:
+                    continue
+                try:
+                    self._validate_output_reservations(
+                        [{"final_path": record.final_path}],
+                        exclude_task_ids=frozenset({record.task_id}),
+                    )
+                    self.repository.activate_scheduled_retry(record.task_id)
+                except (ValueError, sqlite3.IntegrityError):
+                    self.repository.clear_retry_schedule(record.task_id)
+                    self.repository.update_state(
+                        record.task_id,
+                        TaskState.FAILED,
+                        error="输出路径已被另一个活动任务占用，自动重试已停止",
+                    )
+                changed += 1
             while True:
                 try:
                     event = self.event_queue.get_nowait()
@@ -460,23 +485,23 @@ class TaskManager:
                 try:
                     current = self.repository.get_snapshot(event.task_id).state
                 except KeyError:
-                    drained += 1
+                    changed += 1
                     continue
                 if (
                     current in {TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED}
                     and event.state is not current
                 ):
-                    drained += 1
+                    changed += 1
                     continue
                 if current is TaskState.CANCELING and event.state not in {
                     TaskState.CANCELING,
                     TaskState.CANCELED,
                     TaskState.FAILED,
                 }:
-                    drained += 1
+                    changed += 1
                     continue
                 if current is TaskState.PAUSED and event.state is not TaskState.PAUSED:
-                    drained += 1
+                    changed += 1
                     continue
                 running = self._running.get(event.task_id)
                 if event.state is TaskState.PAUSED and running is not None and running.resume_after_pause:
@@ -485,15 +510,15 @@ class TaskManager:
                         self.repository.set_pause_requested(event.task_id, False)
                         self.repository.update_state(event.task_id, TaskState.QUEUED)
                     except ValueError:
-                        drained += 1
+                        changed += 1
                         continue
                     running.paused_exit_expected = True
-                    drained += 1
+                    changed += 1
                     continue
                 try:
                     self.repository.apply_worker_event(event.task_id, event.state, event.payload)
                 except ValueError:
-                    drained += 1
+                    changed += 1
                     continue
                 if event.payload.get("pause_rejected") or event.state in {
                     TaskState.COMPLETED,
@@ -503,10 +528,28 @@ class TaskManager:
                     self.repository.set_pause_requested(event.task_id, False)
                 if event.state is TaskState.PAUSED and event.task_id in self._running:
                     self._running[event.task_id].paused_exit_expected = True
-                drained += 1
+                if event.state is TaskState.FAILED and current is not TaskState.CANCELING:
+                    self._schedule_retry_after_failure_locked(
+                        event.task_id,
+                        str(event.payload.get("error_type") or "WorkerError"),
+                    )
+                changed += 1
             self._reap_locked()
             self._schedule_locked()
-        return drained
+        return changed
+
+    def _schedule_retry_after_failure_locked(self, task_id: str, error_type: str) -> None:
+        record = self.repository.get_private(task_id)
+        if (
+            record.state is not TaskState.FAILED
+            or record.next_retry_at is not None
+            or error_type == "FileExistsError"
+            or record.auto_retry_count >= len(AUTO_RETRY_DELAYS)
+        ):
+            return
+        delay = AUTO_RETRY_DELAYS[record.auto_retry_count]
+        retry_at = self._clock().astimezone(UTC) + timedelta(seconds=delay)
+        self.repository.schedule_retry(task_id, retry_at.isoformat())
 
     def _reap_locked(self) -> None:
         for task_id, running in tuple(self._running.items()):
@@ -526,6 +569,7 @@ class TaskManager:
                     self.repository.update_state(task_id, TaskState.CANCELED)
                 else:
                     self.repository.update_state(task_id, TaskState.FAILED, error="下载进程意外退出")
+                    self._schedule_retry_after_failure_locked(task_id, "ProcessExitError")
             self._running.pop(task_id, None)
             self.controls.pop(task_id, None)
 
