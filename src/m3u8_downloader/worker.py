@@ -145,6 +145,7 @@ def run_download_task(
             completed += 1
             downloaded_bytes += result.bytes_written
             elapsed = max(time.monotonic() - download_started, 0.001)
+            eta_seconds = elapsed / completed * (len(parsed.segments) - completed)
             _emit(
                 event_queue,
                 spec,
@@ -153,6 +154,7 @@ def run_download_task(
                     "completed": completed,
                     "total": len(parsed.segments),
                     "speed_bps": downloaded_bytes / elapsed,
+                    "eta_seconds": eta_seconds,
                 },
             )
 
