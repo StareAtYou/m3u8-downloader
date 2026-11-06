@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices, QGuiApplication
 
 from ..cli import DEFAULT_ADDRESS, connect_or_start, spawn_service
 from ..config import AppPaths
-from ..ipc_client import ServiceClient
+from ..ipc_client import ServiceClient, ServiceError
 from ..naming import sanitize_task_name
 from ..service import load_or_create_auth_key
 from .task_list_model import TaskListModel
@@ -28,20 +28,29 @@ class AppBridge(QObject):
     tasksApplied = Signal()
     requestSucceeded = Signal(str, object)
     requestFailed = Signal(str, str)
+    requestFailedDetailed = Signal(str, str, str, "QVariantMap")
     settingsLoaded = Signal(object)
     defaultSaveDirChanged = Signal()
+    overwriteExistingChanged = Signal()
+    settingsReadyChanged = Signal()
     closeBehaviorChanged = Signal()
     connectionStateChanged = Signal(bool)
     _eventReceived = Signal(object)
     _resultReceived = Signal(str, object)
     _errorReceived = Signal(str, str)
+    _errorDetailReceived = Signal(str, str, str, "QVariantMap")
 
     def __init__(self, client: Any, *, url_opener=None, clipboard_writer=None, parent=None) -> None:
         super().__init__(parent)
         qta.icon("fa6s.download")
         self.client = client
         self._tasks = TaskListModel(self)
-        self._default_save_dir = str(Path.home() / "Downloads")
+        self._fallback_save_dir = str(Path.home() / "Downloads")
+        self._default_save_dir = self._fallback_save_dir
+        self._overwrite_existing = False
+        self._settings_ready = False
+        self._settings_request_pending = False
+        self._pending_submissions: list[tuple[str, object, bool | None]] = []
         self._close_behavior = "tray"
         self._subscription = None
         self._closing = threading.Event()
@@ -53,6 +62,7 @@ class AppBridge(QObject):
         self._eventReceived.connect(self._apply_event)
         self._resultReceived.connect(self._apply_result)
         self._errorReceived.connect(self.requestFailed)
+        self._errorDetailReceived.connect(self._apply_request_error)
 
     @Property(QObject, constant=True)
     def tasks(self) -> TaskListModel:
@@ -61,6 +71,14 @@ class AppBridge(QObject):
     @Property(str, notify=defaultSaveDirChanged)
     def defaultSaveDir(self) -> str:
         return self._default_save_dir
+
+    @Property(bool, notify=overwriteExistingChanged)
+    def overwriteExisting(self) -> bool:
+        return self._overwrite_existing
+
+    @Property(bool, notify=settingsReadyChanged)
+    def settingsReady(self) -> bool:
+        return self._settings_ready
 
     @Property(str, notify=closeBehaviorChanged)
     def closeBehavior(self) -> str:
@@ -90,6 +108,7 @@ class AppBridge(QObject):
             "minus": "fa6s.minus",
             "checkmark": "fa6s.check",
             "chevron-down": "fa6s.chevron-down",
+            "trash": "fa6s.trash-can",
         }
         return qta.charmap(icons.get(name, "fa6s.circle"))
 
@@ -139,42 +158,63 @@ class AppBridge(QObject):
             self._tasks.replace(tasks)
             self.tasksApplied.emit()
 
-    def _request(self, action: str, payload: dict[str, Any]) -> None:
+    def _request(self, action: str, payload: dict[str, Any], *, context: object = None) -> None:
+        request_payload = dict(payload)
+        request_context = dict(context) if isinstance(context, dict) else {}
+
         def run() -> None:
             try:
-                result = self.client.request(action, payload)
+                result = self.client.request(action, request_payload)
+            except ServiceError as exc:
+                self._errorDetailReceived.emit(action, exc.code, str(exc), request_context)
             except Exception as exc:  # noqa: BLE001 - errors cross into UI as text signals
-                self._errorReceived.emit(action, str(exc))
+                self._errorDetailReceived.emit(action, "transport_error", str(exc), request_context)
             else:
                 self._resultReceived.emit(action, result)
 
         self._executor.submit(run)
+
+    @Slot(str, str, str, "QVariantMap")
+    def _apply_request_error(self, action: str, code: str, message: str, context: dict[str, Any]) -> None:
+        if action == "get_settings":
+            self._settings_request_pending = False
+        self.requestFailedDetailed.emit(action, code, message, context)
+        self.requestFailed.emit(action, message)
+
+    def _apply_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        effective = dict(settings)
+        default_dir = str(settings.get("default_save_dir") or self._fallback_save_dir)
+        effective["default_save_dir"] = default_dir
+        if default_dir != self._default_save_dir:
+            self._default_save_dir = default_dir
+            self.defaultSaveDirChanged.emit()
+        overwrite_existing = settings.get("overwrite_existing", self._overwrite_existing)
+        if type(overwrite_existing) is bool and overwrite_existing != self._overwrite_existing:
+            self._overwrite_existing = overwrite_existing
+            self.overwriteExistingChanged.emit()
+        close_behavior = str(settings.get("close_behavior") or self._close_behavior)
+        if close_behavior != self._close_behavior:
+            self._close_behavior = close_behavior
+            self.closeBehaviorChanged.emit()
+        became_ready = not self._settings_ready
+        self._settings_ready = True
+        self._settings_request_pending = False
+        if became_ready:
+            self.settingsReadyChanged.emit()
+        return effective
 
     @Slot(str, object)
     def _apply_result(self, action: str, result: object) -> None:
         if action == "get_settings" and isinstance(result, dict):
             settings = result.get("settings", {})
             if isinstance(settings, dict):
-                default_dir = str(settings.get("default_save_dir") or self._default_save_dir)
-                if default_dir != self._default_save_dir:
-                    self._default_save_dir = default_dir
-                    self.defaultSaveDirChanged.emit()
-                close_behavior = str(settings.get("close_behavior") or self._close_behavior)
-                if close_behavior != self._close_behavior:
-                    self._close_behavior = close_behavior
-                    self.closeBehaviorChanged.emit()
-                self.settingsLoaded.emit(settings)
+                effective = self._apply_settings(settings)
+                self.settingsLoaded.emit(effective)
+                self._flush_pending_submissions()
         elif action == "update_settings" and isinstance(result, dict):
             settings = result.get("settings", {})
             if isinstance(settings, dict):
-                default_dir = str(settings.get("default_save_dir") or self._default_save_dir)
-                if default_dir != self._default_save_dir:
-                    self._default_save_dir = default_dir
-                    self.defaultSaveDirChanged.emit()
-                close_behavior = str(settings.get("close_behavior") or self._close_behavior)
-                if close_behavior != self._close_behavior:
-                    self._close_behavior = close_behavior
-                    self.closeBehaviorChanged.emit()
+                self._apply_settings(settings)
         self.requestSucceeded.emit(action, result)
 
     @Slot(str, result=str)
@@ -198,15 +238,33 @@ class AppBridge(QObject):
     def copyText(self, text: str) -> None:
         self._clipboard_writer(text)
 
-    @Slot(str, str, str, bool)
-    def submitTask(self, url: str, task_name: str, save_root: str, overwrite: bool) -> None:
-        self._request(
-            "submit",
-            {"url": url, "task_name": task_name, "save_root": save_root, "overwrite": overwrite},
-        )
+    def _send_task(self, url: str, task_name: str, save_root: str, *, overwrite: bool) -> None:
+        payload = {
+            "url": url,
+            "task_name": task_name,
+            "save_root": save_root,
+            "overwrite": overwrite,
+        }
+        self._request("submit", payload, context=payload)
 
-    @Slot("QVariantList", str, bool, result=bool)
-    def submitBatch(self, tasks: list[Any], save_root: str, overwrite: bool) -> bool:
+    def _submit_task(self, url: str, task_name: str, *, overwrite: bool) -> None:
+        if not self._settings_ready:
+            self._pending_submissions.append(("single", {"url": url, "task_name": task_name}, None))
+            self.loadSettings()
+            return
+        self._send_task(url, task_name, self._default_save_dir, overwrite=overwrite)
+
+    @Slot(str, str)
+    def submitTask(self, url: str, task_name: str) -> None:
+        self._submit_task(url, task_name, overwrite=self._overwrite_existing)
+
+    @Slot(str, str)
+    @Slot(str, str, str)
+    def submitTaskWithOverwrite(self, url: str, task_name: str, save_root: str = "") -> None:
+        self._send_task(url, task_name, save_root or self._default_save_dir, overwrite=True)
+
+    @Slot("QVariantList", result=bool)
+    def submitBatch(self, tasks: list[Any]) -> bool:
         prepared = []
         try:
             for task in tasks:
@@ -216,12 +274,41 @@ class AppBridge(QObject):
                 name = sanitize_task_name(str(task.get("task_name", "")))
                 if not url:
                     raise ValueError("批量任务 URL 不能为空")
-                prepared.append({"url": url, "task_name": name, "save_root": save_root, "overwrite": overwrite})
+                prepared.append({"url": url, "task_name": name})
         except (TypeError, ValueError) as exc:
             self.requestFailed.emit("submit_batch", str(exc))
             return False
-        self._request("submit_batch", {"tasks": prepared})
+        if not self._settings_ready:
+            self._pending_submissions.append(("batch", prepared, None))
+            self.loadSettings()
+            return True
+        self._send_batch(prepared, overwrite=self._overwrite_existing)
         return True
+
+    def _send_batch(self, tasks: list[dict[str, Any]], *, overwrite: bool) -> None:
+        prepared = [
+            {
+                **task,
+                "save_root": self._default_save_dir,
+                "overwrite": overwrite,
+            }
+            for task in tasks
+        ]
+        self._request("submit_batch", {"tasks": prepared}, context={"tasks": prepared})
+
+    def _flush_pending_submissions(self) -> None:
+        pending, self._pending_submissions = self._pending_submissions, []
+        for kind, value, overwrite in pending:
+            effective_overwrite = self._overwrite_existing if overwrite is None else overwrite
+            if kind == "single" and isinstance(value, dict):
+                self._send_task(
+                    str(value["url"]),
+                    str(value["task_name"]),
+                    self._default_save_dir,
+                    overwrite=effective_overwrite,
+                )
+            elif kind == "batch" and isinstance(value, list):
+                self._send_batch(value, overwrite=effective_overwrite)
 
     @Slot(str, str)
     def controlTask(self, action: str, task_id: str) -> None:
@@ -235,7 +322,18 @@ class AppBridge(QObject):
         self._request("pause_all", {})
 
     @Slot()
+    def resumeAll(self) -> None:
+        self._request("resume_all", {})
+
+    @Slot(str, bool)
+    def deleteTask(self, task_id: str, delete_files: bool) -> None:
+        self._request("delete_task", {"task_id": task_id, "delete_files": delete_files})
+
+    @Slot()
     def loadSettings(self) -> None:
+        if self._settings_request_pending:
+            return
+        self._settings_request_pending = True
         self._request("get_settings", {})
 
     @Slot("QVariantMap")

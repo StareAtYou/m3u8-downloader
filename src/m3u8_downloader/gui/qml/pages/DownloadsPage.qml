@@ -14,6 +14,7 @@ Rectangle {
     property var selectedTask: ({})
     property bool allRowsSelected: false
     property int activeDetailTab: 0
+    signal deleteRequested(string taskId, string taskName, string finalPath)
     property alias tableFocusTarget: taskTable
     readonly property bool compactDetails: width < 892
     readonly property real detailPanelContentHeight: compactDetails ? 330 : Math.max(detailsFlickable.height, 260)
@@ -30,6 +31,7 @@ Rectangle {
     readonly property real routeWidth: wideColumns ? 108 : 100
     readonly property real stateWidth: width < 700 ? 76 : wideColumns ? 122 : 92
     readonly property real actionsWidth: width < 700 ? 72 : wideColumns ? 88 : 104
+    readonly property real actionButtonWidth: width < 700 ? 24 : 30
     readonly property real columnGap: width < 700 ? 6 : 10
     readonly property real fixedColumnWidth: selectionWidth + nameWidth + specWidth + stateWidth + actionsWidth
         + (showSpeed ? speedWidth : 0) + (showEta ? etaWidth : 0) + (showRoute ? routeWidth : 0)
@@ -59,13 +61,63 @@ Rectangle {
     }
 
     Rectangle {
-        id: tableSection
+        id: bulkToolbar
+        objectName: "bulkToolbar"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.top: parent.top
-        height: page.width >= 892
+        height: 52
+        color: "#111d28"
+        border.color: AppTheme.Theme.border
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 16
+            anchors.rightMargin: 16
+            spacing: 10
+            Text {
+                text: "批量操作"
+                color: AppTheme.Theme.text
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
+            }
+            Text {
+                text: "已暂停 " + (page.taskModel ? page.taskModel.pausedCount : 0)
+                    + " · 可暂停 " + (page.taskModel ? page.taskModel.pausableCount : 0)
+                color: AppTheme.Theme.muted
+                font.pixelSize: 13
+            }
+            Item { Layout.fillWidth: true }
+            SecondaryButton {
+                id: pauseAllButton
+                objectName: "pauseAllButton"
+                text: "全部暂停"
+                implicitWidth: 104
+                enabled: page.taskModel && page.taskModel.pausableCount > 0
+                KeyNavigation.tab: resumeAllButton
+                onClicked: bridge.pauseAll()
+            }
+            PrimaryButton {
+                id: resumeAllButton
+                objectName: "resumeAllButton"
+                text: "全部开始"
+                implicitWidth: 104
+                enabled: page.taskModel && page.taskModel.pausedCount > 0
+                KeyNavigation.tab: taskTable
+                KeyNavigation.backtab: pauseAllButton
+                onClicked: bridge.resumeAll()
+            }
+        }
+    }
+
+    Rectangle {
+        id: tableSection
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: bulkToolbar.bottom
+        height: (page.width >= 892
             ? Math.min(516, Math.max(250, page.height - 268))
-            : Math.min(380, Math.max(300, page.height * 0.5))
+            : Math.min(380, Math.max(300, page.height * 0.5))) - bulkToolbar.height
         color: "transparent"
 
         Rectangle {
@@ -134,6 +186,7 @@ Rectangle {
                     required property int completed
                     required property int total
                     required property string speedText
+                    required property string etaText
                     required property string route
                     required property string finalPath
                     required property bool canPause
@@ -141,6 +194,7 @@ Rectangle {
                     required property bool canRetry
                     required property bool canOpen
                     required property bool canCancel
+                    required property bool canDelete
                     width: taskTable.width
                     height: AppTheme.Theme.taskRowHeight
                     color: ListView.isCurrentItem ? "#142b42" : rowMouse.containsMouse ? "#111f2c" : "transparent"
@@ -226,7 +280,7 @@ Rectangle {
                         Text { objectName: "rowSpeedColumn"; text: row.speedText; color: AppTheme.Theme.text; font.pixelSize: 13; Layout.preferredWidth: page.speedWidth; Layout.minimumWidth: page.speedWidth; Layout.maximumWidth: page.speedWidth; visible: page.showSpeed }
                         Text {
                             objectName: row.index === 0 ? "firstEta" : "rowEta"
-                            text: "—"
+                            text: row.etaText
                             color: AppTheme.Theme.muted
                             font.pixelSize: 13
                             Layout.preferredWidth: page.etaWidth
@@ -260,6 +314,7 @@ Rectangle {
                             ToolButton {
                                 id: pauseButton
                                 visible: row.canPause
+                                Layout.preferredWidth: page.actionButtonWidth
                                 onClicked: bridge.controlTask("pause", row.taskId)
                                 background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
                                 contentItem: Icon { name: "pause"; color: AppTheme.Theme.text }
@@ -268,6 +323,7 @@ Rectangle {
                             }
                             ToolButton {
                                 visible: row.canResume
+                                Layout.preferredWidth: page.actionButtonWidth
                                 onClicked: bridge.controlTask("resume", row.taskId)
                                 background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
                                 contentItem: Icon { name: "play"; color: AppTheme.Theme.green }
@@ -276,6 +332,7 @@ Rectangle {
                             }
                             ToolButton {
                                 visible: row.canRetry
+                                Layout.preferredWidth: page.actionButtonWidth
                                 onClicked: bridge.controlTask("retry", row.taskId)
                                 background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
                                 contentItem: Icon { name: "retry"; color: AppTheme.Theme.blue }
@@ -284,6 +341,7 @@ Rectangle {
                             }
                             ToolButton {
                                 visible: row.canOpen
+                                Layout.preferredWidth: page.actionButtonWidth
                                 onClicked: bridge.openOutputFolder(row.finalPath)
                                 background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
                                 contentItem: Icon { name: "folder"; color: AppTheme.Theme.text }
@@ -292,11 +350,22 @@ Rectangle {
                             }
                             ToolButton {
                                 visible: row.canCancel
+                                Layout.preferredWidth: page.actionButtonWidth
                                 onClicked: bridge.controlTask("cancel", row.taskId)
                                 background: Rectangle { color: parent.hovered ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
                                 contentItem: Icon { name: "cancel"; color: AppTheme.Theme.muted }
                                 ToolTip.visible: hovered
                                 ToolTip.text: "取消"
+                            }
+                            ToolButton {
+                                objectName: "deleteTaskButton"
+                                enabled: row.canDelete
+                                Layout.preferredWidth: page.actionButtonWidth
+                                onClicked: page.deleteRequested(row.taskId, row.taskName, row.finalPath)
+                                background: Rectangle { color: parent.hovered && parent.enabled ? AppTheme.Theme.surfaceHover : "transparent"; radius: AppTheme.Theme.radiusSmall }
+                                contentItem: Icon { name: "trash"; color: parent.enabled ? AppTheme.Theme.red : AppTheme.Theme.muted }
+                                ToolTip.visible: hovered
+                                ToolTip.text: row.canDelete ? "删除任务" : "请先暂停或等待任务结束"
                             }
                         }
                     }
@@ -560,6 +629,7 @@ Rectangle {
         target: page.taskModel
         ignoreUnknownSignals: true
         function onCountChanged() { Qt.callLater(page.refreshSelectedTask) }
+        function onDataChanged() { Qt.callLater(page.refreshSelectedTask) }
     }
     Connections {
         target: taskTable

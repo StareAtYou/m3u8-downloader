@@ -3,12 +3,14 @@ from __future__ import annotations
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from m3u8_downloader.manager import Submission, TaskManager
-from m3u8_downloader.models import AppSettings, TaskState
+from m3u8_downloader.models import AppSettings, OverwritePolicy, TaskState
+from m3u8_downloader.settings_store import JsonSettingsStore
 from m3u8_downloader.storage import TaskRepository
 from m3u8_downloader.worker import WorkerEvent
 
@@ -20,6 +22,7 @@ class FakeProcess:
         self.alive = False
         self.exitcode = None
         self.terminated = False
+        self.on_join = None
 
     def start(self) -> None:
         self.started = True
@@ -29,7 +32,9 @@ class FakeProcess:
         return self.alive
 
     def join(self, timeout=None) -> None:
-        return None
+        if self.on_join is not None:
+            callback, self.on_join = self.on_join, None
+            callback()
 
     def terminate(self) -> None:
         self.terminated = True
@@ -49,7 +54,18 @@ class Launcher:
         return process
 
 
-def manager(tmp_path: Path, *, max_active: int = 3):
+class FakeClock:
+    def __init__(self, value: datetime | None = None) -> None:
+        self.value = value or datetime(2026, 11, 6, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += timedelta(seconds=seconds)
+
+
+def manager(tmp_path: Path, *, max_active: int = 3, clock: FakeClock | None = None):
     repository = TaskRepository(tmp_path / "state.sqlite3")
     repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=max_active))
     launcher = Launcher()
@@ -60,8 +76,26 @@ def manager(tmp_path: Path, *, max_active: int = 3):
         process_launcher=launcher,
         event_queue=events,
         merge_lock=threading.Lock(),
+        **({"clock": clock} if clock is not None else {}),
     )
     return instance, repository, launcher, events
+
+
+def _fail_running_task(
+    instance: TaskManager,
+    repository: TaskRepository,
+    launcher: Launcher,
+    events: queue.Queue,
+    task_id: str,
+    *,
+    error_type: str = "RuntimeError",
+) -> None:
+    events.put(WorkerEvent(task_id, TaskState.FAILED, {"error": "temporary", "error_type": error_type}))
+    process = next(item for item in reversed(launcher.processes) if item.task_id == task_id and item.alive)
+    process.alive = False
+    process.exitcode = 1
+    instance.drain_worker_events()
+    assert repository.get_snapshot(task_id).state is TaskState.FAILED
 
 
 def test_submission_validates_name_url_path_and_explicit_overwrite(tmp_path: Path) -> None:
@@ -147,6 +181,23 @@ def _put_success(events, task_id: str) -> None:
         events.put(WorkerEvent(task_id, state, {}))
 
 
+def _manual_manager(tmp_path: Path) -> tuple[TaskManager, TaskRepository]:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    return TaskManager(repository, tmp_path / "workspaces", auto_schedule=False), repository
+
+
+def _complete(repository: TaskRepository, task_id: str) -> None:
+    for state in (
+        TaskState.PROBING,
+        TaskState.PARSING,
+        TaskState.DOWNLOADING,
+        TaskState.WAITING_MERGE,
+        TaskState.MERGING,
+        TaskState.COMPLETED,
+    ):
+        repository.update_state(task_id, state)
+
+
 def test_scheduler_enforces_limit_drains_events_and_reaps_processes(tmp_path: Path) -> None:
     instance, repository, launcher, events = manager(tmp_path, max_active=2)
     tasks = [instance.submit(f"https://example/{index}.m3u8", f"Task {index}", tmp_path) for index in range(3)]
@@ -164,6 +215,418 @@ def test_scheduler_enforces_limit_drains_events_and_reaps_processes(tmp_path: Pa
     launcher.processes[1].exitcode = 2
     instance.drain_worker_events()
     assert repository.get_snapshot(tasks[1].task_id).state == TaskState.FAILED
+
+
+def test_newest_first_display_keeps_oldest_first_scheduler(tmp_path: Path) -> None:
+    instance, _, launcher, events = manager(tmp_path, max_active=1)
+    tasks = [instance.submit(f"https://example/{index}.m3u8", f"Task {index}", tmp_path) for index in range(3)]
+
+    assert [item.task_id for item in instance.list()] == [task.task_id for task in reversed(tasks)]
+    assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id]
+
+    _put_success(events, tasks[0].task_id)
+    launcher.processes[0].alive = False
+    launcher.processes[0].exitcode = 0
+    instance.drain_worker_events()
+
+    assert [spec.task_id for spec in launcher.specs] == [tasks[0].task_id, tasks[1].task_id]
+
+
+def test_automatic_retry_uses_three_persisted_backoff_delays_then_stops(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/retry.m3u8", "Retry", tmp_path)
+    expected_delays = (2, 5, 10)
+
+    for attempt, delay in enumerate(expected_delays, start=1):
+        _fail_running_task(instance, repository, launcher, events, task.task_id)
+        waiting = repository.get_snapshot(task.task_id)
+        assert waiting.auto_retry_count == attempt
+        assert waiting.next_retry_at == (clock.value + timedelta(seconds=delay)).isoformat()
+        instance.drain_worker_events()
+        assert len(launcher.specs) == attempt
+        clock.advance(delay)
+        instance.drain_worker_events()
+        assert len(launcher.specs) == attempt + 1
+
+    _fail_running_task(instance, repository, launcher, events, task.task_id)
+    exhausted = repository.get_snapshot(task.task_id)
+    assert exhausted.auto_retry_count == 3
+    assert exhausted.next_retry_at is None
+    clock.advance(60)
+    instance.drain_worker_events()
+    assert len(launcher.specs) == 4
+
+
+def test_automatic_retry_skips_file_conflict_and_manual_retry_resets_budget(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    conflict = instance.submit("https://example/conflict.m3u8", "Conflict", tmp_path)
+    _fail_running_task(
+        instance,
+        repository,
+        launcher,
+        events,
+        conflict.task_id,
+        error_type="FileExistsError",
+    )
+    assert repository.get_snapshot(conflict.task_id).auto_retry_count == 0
+    assert repository.get_snapshot(conflict.task_id).next_retry_at is None
+
+    instance.retry(conflict.task_id)
+    _fail_running_task(instance, repository, launcher, events, conflict.task_id)
+    assert repository.get_snapshot(conflict.task_id).auto_retry_count == 1
+    instance.retry(conflict.task_id)
+    reset = repository.get_snapshot(conflict.task_id)
+    assert reset.state is TaskState.PROBING
+    assert reset.auto_retry_count == 0
+    assert reset.next_retry_at is None
+
+
+def test_due_retries_survive_restart_and_keep_fifo_limit(tmp_path: Path) -> None:
+    clock = FakeClock()
+    database = tmp_path / "state.sqlite3"
+    first_repository = TaskRepository(database)
+    first_repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=1))
+    oldest = first_repository.create_task(
+        task_id="oldest",
+        url="https://example/oldest.m3u8",
+        task_name="Oldest",
+        filename="Oldest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "oldest"),
+        final_path=str(tmp_path / "Oldest" / "Oldest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    newest = first_repository.create_task(
+        task_id="newest",
+        url="https://example/newest.m3u8",
+        task_name="Newest",
+        filename="Newest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "newest"),
+        final_path=str(tmp_path / "Newest" / "Newest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    first_repository._connection.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-11-01T00:00:00+00:00", oldest.task_id),
+    )
+    first_repository._connection.execute(
+        "UPDATE tasks SET created_at = ? WHERE task_id = ?",
+        ("2026-11-02T00:00:00+00:00", newest.task_id),
+    )
+    first_repository._connection.commit()
+    for task in (oldest, newest):
+        first_repository.update_state(task.task_id, TaskState.FAILED, error="temporary")
+        first_repository.schedule_retry(task.task_id, (clock.value + timedelta(seconds=2)).isoformat())
+    first_repository.close()
+
+    clock.advance(2)
+    repository = TaskRepository(database)
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+        clock=clock,
+    )
+
+    changed = instance.drain_worker_events()
+
+    assert changed == 2
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+    assert repository.get_snapshot(oldest.task_id).auto_retry_count == 1
+    assert repository.get_snapshot(newest.task_id).state is TaskState.QUEUED
+    instance.drain_worker_events()
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+
+
+def test_resume_all_keeps_retry_deadline_and_does_not_launch_early(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/retry.m3u8", "Retry", tmp_path)
+    _fail_running_task(instance, repository, launcher, events, task.task_id)
+    deadline = repository.get_snapshot(task.task_id).next_retry_at
+
+    assert instance.resume_all() == []
+    assert repository.get_snapshot(task.task_id).next_retry_at == deadline
+    assert len(launcher.specs) == 1
+
+
+def test_automatic_retry_stops_when_output_was_reserved_by_a_new_task(tmp_path: Path) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    original = instance.submit("https://example/original.m3u8", "Same", tmp_path)
+    _fail_running_task(instance, repository, launcher, events, original.task_id)
+    replacement = instance.submit("https://example/replacement.m3u8", "Same", tmp_path)
+
+    clock.advance(2)
+    changed = instance.drain_worker_events()
+
+    blocked = repository.get_snapshot(original.task_id)
+    assert changed == 1
+    assert blocked.state is TaskState.FAILED
+    assert blocked.next_retry_at is None
+    assert blocked.error == "输出路径已被另一个活动任务占用，自动重试已停止"
+    assert [spec.task_id for spec in launcher.specs] == [original.task_id, replacement.task_id]
+
+
+def test_failed_event_and_retry_deadline_commit_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/atomic.m3u8", "Atomic", tmp_path)
+    before = repository.get_snapshot(task.task_id)
+    monkeypatch.setattr(
+        repository,
+        "schedule_retry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("crash between writes")),
+    )
+    events.put(WorkerEvent(task.task_id, TaskState.FAILED, {"error": "temporary", "error_type": "RuntimeError"}))
+
+    with pytest.raises(RuntimeError, match="between writes"):
+        instance.drain_worker_events()
+
+    after = repository.get_snapshot(task.task_id)
+    assert after.state is before.state
+    assert after.error == before.error
+    assert after.auto_retry_count == 0
+    assert after.next_retry_at is None
+    assert launcher.processes[0].alive is True
+
+
+def test_manual_retry_state_and_budget_commit_atomically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock()
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=clock)
+    task = instance.submit("https://example/manual.m3u8", "Manual", tmp_path)
+    _fail_running_task(instance, repository, launcher, events, task.task_id)
+    before = repository.get_snapshot(task.task_id)
+    original_update_state = repository.update_state
+
+    def fail_queue(task_id, target, **kwargs):
+        if target is TaskState.QUEUED:
+            raise RuntimeError("crash before queue")
+        return original_update_state(task_id, target, **kwargs)
+
+    monkeypatch.setattr(repository, "update_state", fail_queue)
+    with pytest.raises(RuntimeError, match="before queue"):
+        instance.retry(task.task_id)
+
+    after = repository.get_snapshot(task.task_id)
+    assert after.state is TaskState.FAILED
+    assert after.auto_retry_count == before.auto_retry_count == 1
+    assert after.next_retry_at == before.next_retry_at
+
+
+def test_dispatched_attempt_is_persisted_before_worker_start_and_recovers_interrupted(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    repository = TaskRepository(database)
+    repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=1))
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+    )
+    task = instance.submit("https://example/dispatch.m3u8", "Dispatch", tmp_path)
+
+    assert repository.get_snapshot(task.task_id).state is TaskState.PROBING
+    repository.close()
+    reopened = TaskRepository(database)
+    recovered = TaskManager(reopened, tmp_path / "workspaces", auto_schedule=False)
+    assert recovered.get(task.task_id).state is TaskState.INTERRUPTED
+
+
+def test_pause_request_prevents_probe_failure_from_auto_relaunch(tmp_path: Path) -> None:
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=FakeClock())
+    task = instance.submit("https://example/pause.m3u8", "Pause", tmp_path)
+    events.put(WorkerEvent(task.task_id, TaskState.PROBING, {}))
+    instance.drain_worker_events()
+    instance.pause(task.task_id)
+    events.put(WorkerEvent(task.task_id, TaskState.FAILED, {"error": "probe failed", "error_type": "RuntimeError"}))
+    launcher.processes[0].alive = False
+    launcher.processes[0].exitcode = 1
+
+    instance.drain_worker_events()
+
+    stopped = repository.get_snapshot(task.task_id)
+    assert stopped.state is TaskState.PAUSED
+    assert stopped.pause_requested is False
+    assert stopped.auto_retry_count == 0
+    assert stopped.next_retry_at is None
+    assert len(launcher.specs) == 1
+
+
+def test_manual_retry_waits_for_previous_terminal_process_to_reap(tmp_path: Path) -> None:
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=FakeClock())
+    task = instance.submit("https://example/manual.m3u8", "Manual", tmp_path)
+    events.put(WorkerEvent(task.task_id, TaskState.FAILED, {"error": "temporary", "error_type": "RuntimeError"}))
+    instance.drain_worker_events()
+    assert launcher.processes[0].alive is True
+
+    instance.retry(task.task_id)
+    launcher.processes[0].alive = False
+    launcher.processes[0].exitcode = 1
+    instance.drain_worker_events()
+
+    retried = repository.get_snapshot(task.task_id)
+    assert retried.state is TaskState.PROBING
+    assert retried.auto_retry_count == 0
+    assert len(launcher.specs) == 2
+
+
+def test_reaper_drains_terminal_event_enqueued_during_join(tmp_path: Path) -> None:
+    instance, repository, launcher, events = manager(tmp_path, max_active=1, clock=FakeClock())
+    task = instance.submit("https://example/race.m3u8", "Race", tmp_path)
+    process = launcher.processes[0]
+    process.alive = False
+    process.exitcode = 1
+    process.on_join = lambda: events.put(
+        WorkerEvent(task.task_id, TaskState.FAILED, {"error": "目标文件已存在", "error_type": "FileExistsError"})
+    )
+
+    changed = instance.drain_worker_events()
+
+    failed = repository.get_snapshot(task.task_id)
+    assert changed == 1
+    assert failed.state is TaskState.FAILED
+    assert failed.error == "目标文件已存在"
+    assert failed.auto_retry_count == 0
+    assert failed.next_retry_at is None
+
+
+def test_reaper_reports_synthetic_process_failure_as_a_change(tmp_path: Path) -> None:
+    instance, repository, launcher, _events = manager(tmp_path, max_active=1, clock=FakeClock())
+    task = instance.submit("https://example/crash.m3u8", "Crash", tmp_path)
+    launcher.processes[0].alive = False
+    launcher.processes[0].exitcode = 1
+
+    changed = instance.drain_worker_events()
+
+    assert changed == 1
+    assert repository.get_snapshot(task.task_id).state is TaskState.FAILED
+
+
+def test_process_control_setup_failure_uses_bounded_retry_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance, repository, launcher, _events = manager(tmp_path, max_active=1, clock=FakeClock())
+    monkeypatch.setattr(
+        "m3u8_downloader.manager.ProcessTaskControl",
+        lambda _context: (_ for _ in ()).throw(OSError("control unavailable")),
+    )
+
+    task = instance.submit("https://example/setup.m3u8", "Setup", tmp_path)
+
+    failed = repository.get_snapshot(task.task_id)
+    assert failed.state is TaskState.FAILED
+    assert failed.auto_retry_count == 1
+    assert failed.next_retry_at is not None
+    assert launcher.specs == []
+
+
+def test_delete_record_only_preserves_files_and_active_worker_is_rejected(tmp_path: Path) -> None:
+    active, _, _, _ = manager(tmp_path / "active", max_active=1)
+    running = active.submit("https://example/running.m3u8", "Running", tmp_path / "active")
+    with pytest.raises(ValueError, match="暂停或结束"):
+        active.delete(running.task_id)
+
+    instance, repository = _manual_manager(tmp_path / "idle")
+    task = instance.submit("https://example/idle.m3u8", "Idle", tmp_path / "idle")
+    workspace = Path(task.workspace)
+    final_path = Path(task.final_path)
+    workspace.mkdir(parents=True)
+    workspace.joinpath("segment.ts").write_bytes(b"segment")
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(b"video")
+
+    result = instance.delete(task.task_id)
+
+    assert result == {"task_id": task.task_id, "deleted_files": []}
+    assert workspace.exists()
+    assert final_path.exists()
+    with pytest.raises(KeyError):
+        repository.get_private(task.task_id)
+
+
+def test_delete_files_removes_exact_owned_paths_but_keeps_parents_and_noncompleted_output(tmp_path: Path) -> None:
+    instance, repository = _manual_manager(tmp_path)
+    completed = instance.submit("https://example/completed.m3u8", "Completed", tmp_path)
+    _complete(repository, completed.task_id)
+    workspace = Path(completed.workspace)
+    workspace.mkdir(parents=True)
+    workspace.joinpath("segment.ts").write_bytes(b"segment")
+    workspace_sibling = workspace.parent / "keep-workspace"
+    workspace_sibling.mkdir()
+    final_path = Path(completed.final_path)
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(b"video")
+    output_sibling = final_path.parent / "keep.txt"
+    output_sibling.write_text("keep")
+
+    result = instance.delete(completed.task_id, delete_files=True)
+
+    assert set(result["deleted_files"]) == {str(workspace), str(final_path)}
+    assert not workspace.exists()
+    assert not final_path.exists()
+    assert workspace_sibling.is_dir()
+    assert output_sibling.read_text() == "keep"
+    assert final_path.parent.is_dir()
+
+    paused = instance.submit("https://example/paused.m3u8", "Paused", tmp_path)
+    instance.pause(paused.task_id)
+    paused_workspace = Path(paused.workspace)
+    paused_workspace.mkdir(parents=True)
+    paused_final = Path(paused.final_path)
+    paused_final.parent.mkdir(parents=True)
+    paused_final.write_bytes(b"pre-existing")
+
+    instance.delete(paused.task_id, delete_files=True)
+
+    assert not paused_workspace.exists()
+    assert paused_final.read_bytes() == b"pre-existing"
+
+
+def test_delete_files_blocks_shared_completed_output_and_accepts_missing_exact_paths(tmp_path: Path) -> None:
+    instance, repository = _manual_manager(tmp_path)
+    shared = tmp_path / "shared.mp4"
+    first = repository.create_task(
+        task_id="first",
+        url="https://example/first.m3u8",
+        task_name="First",
+        filename=shared.name,
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspace-first"),
+        final_path=str(shared),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    _complete(repository, first.task_id)
+    second = repository.create_task(
+        task_id="second",
+        url="https://example/second.m3u8",
+        task_name="Second",
+        filename=shared.name,
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspace-second"),
+        final_path=str(shared),
+        overwrite_policy=OverwritePolicy.OVERWRITE,
+    )
+    _complete(repository, second.task_id)
+    shared.write_bytes(b"latest")
+
+    with pytest.raises(ValueError, match="其他任务"):
+        instance.delete(first.task_id, delete_files=True)
+    assert shared.read_bytes() == b"latest"
+    assert repository.get_private(first.task_id).task_id == "first"
+
+    repository.delete_task(second.task_id)
+    shared.unlink()
+    result = instance.delete(first.task_id, delete_files=True)
+    assert result == {"task_id": "first", "deleted_files": []}
 
 
 def test_control_commands_settings_restart_and_bounded_shutdown(tmp_path: Path) -> None:
@@ -211,6 +674,35 @@ def test_worker_spec_receives_explicit_proxy_policy(tmp_path: Path) -> None:
     assert launcher.specs[-1].manual_proxy == "socks5://127.0.0.1:7890"
 
 
+def test_manager_uses_injected_settings_store_for_updates_and_worker_specs(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    store = JsonSettingsStore(tmp_path / "settings.json")
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        settings_store=store,
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+    )
+    settings = AppSettings(
+        default_save_dir=str(tmp_path),
+        max_active_tasks=2,
+        segment_threads=7,
+        proxy_policy="direct",
+        ffmpeg_path="/custom/ffmpeg",
+    )
+
+    instance.update_settings(settings)
+    instance.submit("https://example/settings.m3u8", "Settings", tmp_path)
+
+    assert instance.get_settings() == settings
+    assert launcher.specs[-1].segment_workers == 7
+    assert launcher.specs[-1].proxy_policy == "direct"
+    assert launcher.specs[-1].ffmpeg_path == "/custom/ffmpeg"
+
+
 def test_disabled_auto_schedule_stays_disabled_after_resume(tmp_path: Path) -> None:
     repository = TaskRepository(tmp_path / "state.sqlite3")
     launcher = Launcher()
@@ -231,8 +723,51 @@ def test_disabled_auto_schedule_stays_disabled_after_resume(tmp_path: Path) -> N
     assert instance.get(task.task_id).state is TaskState.QUEUED
 
 
-def test_pause_all_skips_merging_and_part_files_do_not_count_as_completed(tmp_path: Path) -> None:
-    instance, repository, _, events = manager(tmp_path, max_active=2)
+def test_resume_all_schedules_oldest_paused_task_first(tmp_path: Path) -> None:
+    repository = TaskRepository(tmp_path / "state.sqlite3")
+    repository.update_settings(AppSettings(default_save_dir=str(tmp_path), max_active_tasks=1))
+    oldest = repository.create_task(
+        task_id="oldest",
+        url="https://example/oldest.m3u8",
+        task_name="Oldest",
+        filename="Oldest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "oldest"),
+        final_path=str(tmp_path / "Oldest" / "Oldest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    newest = repository.create_task(
+        task_id="newest",
+        url="https://example/newest.m3u8",
+        task_name="Newest",
+        filename="Newest.mp4",
+        save_root=str(tmp_path),
+        workspace=str(tmp_path / "workspaces" / "newest"),
+        final_path=str(tmp_path / "Newest" / "Newest.mp4"),
+        overwrite_policy=OverwritePolicy.REJECT,
+    )
+    repository.update_state(oldest.task_id, TaskState.PAUSED)
+    repository.update_state(newest.task_id, TaskState.PAUSED)
+    launcher = Launcher()
+    instance = TaskManager(
+        repository,
+        tmp_path / "workspaces",
+        process_launcher=launcher,
+        event_queue=queue.Queue(),
+        merge_lock=threading.Lock(),
+    )
+
+    resumed = instance.resume_all()
+
+    assert resumed == [oldest.task_id, newest.task_id]
+    assert [spec.task_id for spec in launcher.specs] == [oldest.task_id]
+    assert instance.get(newest.task_id).state is TaskState.QUEUED
+
+
+def test_pause_all_skips_merging_resume_all_starts_only_paused_and_part_files_do_not_count(
+    tmp_path: Path,
+) -> None:
+    instance, repository, launcher, events = manager(tmp_path, max_active=2)
     first = instance.submit("https://example/1.m3u8", "First", tmp_path)
     second = instance.submit("https://example/2.m3u8", "Second", tmp_path)
     for state in (
@@ -254,6 +789,16 @@ def test_pause_all_skips_merging_and_part_files_do_not_count_as_completed(tmp_pa
     workspace.mkdir(parents=True, exist_ok=True)
     workspace.joinpath("000000.ts.part").write_bytes(b"partial")
     assert repository.get_snapshot(second.task_id).completed == 0
+
+    events.put(WorkerEvent(second.task_id, TaskState.PAUSED, {}))
+    launcher.processes[1].alive = False
+    launcher.processes[1].exitcode = 0
+    instance.drain_worker_events()
+
+    resumed = instance.resume_all()
+    assert resumed == [second.task_id]
+    assert repository.get_snapshot(second.task_id).state is TaskState.PROBING
+    assert repository.get_snapshot(first.task_id).state is TaskState.MERGING
 
 
 def test_cancel_ignores_in_flight_progress_and_monitor_can_process_later_events(tmp_path: Path) -> None:
@@ -303,7 +848,7 @@ def test_resume_wins_over_delayed_pause_acknowledgement(tmp_path: Path) -> None:
     launcher.processes[0].exitcode = 0
     instance.drain_worker_events()
 
-    assert repository.get_snapshot(task.task_id).state is TaskState.QUEUED
+    assert repository.get_snapshot(task.task_id).state is TaskState.PROBING
     assert len(launcher.processes) == 2
     assert instance.controls[task.task_id].paused is False
 

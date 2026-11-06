@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import IntEnum
 from typing import Any
 
@@ -28,6 +29,8 @@ class TaskRole(IntEnum):
     CAN_OPEN = Qt.UserRole + 17
     REDACTED_URL = Qt.UserRole + 18
     SAVE_ROOT = Qt.UserRole + 19
+    CAN_DELETE = Qt.UserRole + 20
+    ETA_TEXT = Qt.UserRole + 21
 
 
 ROLE_NAMES = {
@@ -50,6 +53,8 @@ ROLE_NAMES = {
     TaskRole.CAN_OPEN: b"canOpen",
     TaskRole.REDACTED_URL: b"redactedUrl",
     TaskRole.SAVE_ROOT: b"saveRoot",
+    TaskRole.CAN_DELETE: b"canDelete",
+    TaskRole.ETA_TEXT: b"etaText",
 }
 
 _SAFE_FIELDS = {
@@ -66,6 +71,9 @@ _SAFE_FIELDS = {
     "redacted_url",
     "save_root",
     "pause_requested",
+    "auto_retry_count",
+    "next_retry_at",
+    "eta_seconds",
 }
 
 _ROOT_INDEX = QModelIndex()
@@ -81,8 +89,28 @@ def _speed(value: float) -> str:
     return f"{value / 1024**2:.1f} MB/s"
 
 
+def _eta_text(state: str, value: object) -> str:
+    if state != "downloading" or type(value) not in {int, float}:
+        return "—"
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        return "—"
+    if seconds < 60:
+        return f"约 {math.ceil(seconds)} 秒"
+    total_minutes = math.ceil(seconds / 60)
+    if total_minutes < 60:
+        return f"约 {total_minutes} 分钟"
+    hours, minutes = divmod(total_minutes, 60)
+    if minutes == 0:
+        return f"约 {hours} 小时"
+    return f"约 {hours} 小时 {minutes} 分钟"
+
+
 class TaskListModel(QAbstractListModel):
     countChanged = Signal()
+    completedCountChanged = Signal()
+    pausableCountChanged = Signal()
+    pausedCountChanged = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -98,9 +126,20 @@ class TaskListModel(QAbstractListModel):
     def count(self) -> int:
         return len(self._items)
 
-    @Property(int, notify=countChanged)
+    @Property(int, notify=completedCountChanged)
     def completedCount(self) -> int:
         return sum(item.get("state") == "completed" for item in self._items)
+
+    @Property(int, notify=pausableCountChanged)
+    def pausableCount(self) -> int:
+        return sum(
+            item.get("state") in {"queued", "probing", "parsing", "downloading", "waiting_merge"}
+            for item in self._items
+        )
+
+    @Property(int, notify=pausedCountChanged)
+    def pausedCount(self) -> int:
+        return sum(item.get("state") == "paused" for item in self._items)
 
     def item(self, row: int) -> dict[str, Any]:
         return dict(self._items[row])
@@ -119,16 +158,21 @@ class TaskListModel(QAbstractListModel):
         if role == Qt.DisplayRole:
             return item.get("task_name", "")
         state = str(item.get("state", ""))
+        state_label = STATE_LABELS.get(state, state)
+        retry_count = item.get("auto_retry_count", 0)
+        if state == "failed" and item.get("next_retry_at") and type(retry_count) is int and retry_count > 0:
+            state_label = f"等待重试 {retry_count}/3"
         values = {
             TaskRole.TASK_ID: item.get("task_id", ""),
             TaskRole.TASK_NAME: item.get("task_name", ""),
             TaskRole.FILENAME: item.get("filename", ""),
             TaskRole.STATE: state,
-            TaskRole.STATE_LABEL: STATE_LABELS.get(state, state),
+            TaskRole.STATE_LABEL: state_label,
             TaskRole.PROGRESS: min(1.0, int(item.get("completed", 0)) / max(1, int(item.get("total", 0)))),
             TaskRole.COMPLETED: int(item.get("completed", 0)),
             TaskRole.TOTAL: int(item.get("total", 0)),
             TaskRole.SPEED_TEXT: _speed(float(item.get("speed_bps", 0) or 0)),
+            TaskRole.ETA_TEXT: _eta_text(state, item.get("eta_seconds")),
             TaskRole.ROUTE: item.get("route") or "检测中",
             TaskRole.ERROR_TEXT: item.get("error") or "",
             TaskRole.FINAL_PATH: item.get("final_path") or "",
@@ -140,6 +184,7 @@ class TaskListModel(QAbstractListModel):
             in {"queued", "probing", "parsing", "downloading", "paused", "waiting_merge", "interrupted"},
             TaskRole.CAN_RETRY: state in {"failed", "canceled", "interrupted"},
             TaskRole.CAN_OPEN: state == "completed",
+            TaskRole.CAN_DELETE: state in {"paused", "failed", "canceled", "interrupted", "completed"},
         }
         try:
             return values[TaskRole(role)]
@@ -148,7 +193,39 @@ class TaskListModel(QAbstractListModel):
 
     def replace(self, snapshots: list[dict[str, Any]]) -> None:
         safe = [{key: value for key, value in snapshot.items() if key in _SAFE_FIELDS} for snapshot in snapshots]
+        old_completed_count = self.completedCount
+        old_pausable_count = self.pausableCount
+        old_paused_count = self.pausedCount
+        old_task_ids = [item.get("task_id") for item in self._items]
+        new_task_ids = [item.get("task_id") for item in safe]
+        if old_task_ids == new_task_ids:
+            changed_rows = [row for row, (old, new) in enumerate(zip(self._items, safe, strict=True)) if old != new]
+            if not changed_rows:
+                return
+            self._items = safe
+            changed_roles = [int(role) for role in ROLE_NAMES]
+            range_start = previous_row = changed_rows[0]
+            for row in changed_rows[1:]:
+                if row != previous_row + 1:
+                    self.dataChanged.emit(self.index(range_start, 0), self.index(previous_row, 0), changed_roles)
+                    range_start = row
+                previous_row = row
+            self.dataChanged.emit(self.index(range_start, 0), self.index(previous_row, 0), changed_roles)
+            if self.completedCount != old_completed_count:
+                self.completedCountChanged.emit()
+            if self.pausableCount != old_pausable_count:
+                self.pausableCountChanged.emit()
+            if self.pausedCount != old_paused_count:
+                self.pausedCountChanged.emit()
+            return
+
         self.beginResetModel()
         self._items = safe
         self.endResetModel()
         self.countChanged.emit()
+        if self.completedCount != old_completed_count:
+            self.completedCountChanged.emit()
+        if self.pausableCount != old_pausable_count:
+            self.pausableCountChanged.emit()
+        if self.pausedCount != old_paused_count:
+            self.pausedCountChanged.emit()

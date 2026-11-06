@@ -15,6 +15,7 @@ from .config import AppPaths
 from .ipc_client import ServiceClient, ServiceError
 from .manager import TaskManager
 from .service import ServiceAlreadyRunning, ServiceInstanceLock, ServiceServer, load_or_create_auth_key
+from .settings_store import JsonSettingsStore
 from .storage import TaskRepository
 from .terminal_view import render_tasks
 
@@ -153,7 +154,11 @@ def service_main(argv: Sequence[str] | None = None) -> int:
     manager = None
     try:
         repository = TaskRepository(paths.data_dir / "tasks.sqlite3")
-        manager = TaskManager(repository, paths.cache_dir / "workspaces")
+        manager = TaskManager(
+            repository,
+            paths.cache_dir / "workspaces",
+            settings_store=JsonSettingsStore(paths.config_dir / "settings.json", fallback=repository.get_settings),
+        )
         server = ServiceServer(
             manager,
             authkey=load_or_create_auth_key(paths.config_dir / "service.key"),

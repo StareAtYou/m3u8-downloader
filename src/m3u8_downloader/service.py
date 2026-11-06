@@ -156,7 +156,15 @@ class ServiceServer:
                 with self._subscribers_lock:
                     self._subscribers.add(connection)
                 return
-            result = self._dispatch(request)
+            try:
+                result = self._dispatch(request)
+            except FileExistsError:
+                raise
+            except OSError as exc:
+                raise ProtocolError(
+                    "filesystem_error",
+                    "本地文件操作失败，请检查文件占用或目录权限后重试",
+                ) from exc
             send_frame(connection, ResponseFrame.success(request_id, result))
             if request.action not in {"ping", "list", "get", "get_settings"}:
                 self.broadcast_tasks()
@@ -164,7 +172,9 @@ class ServiceServer:
             send_frame(connection, ResponseFrame.error_response(request_id, exc.code, exc.message))
         except KeyError:
             send_frame(connection, ResponseFrame.error_response(request_id, "not_found", "任务不存在"))
-        except (ValueError, FileExistsError) as exc:
+        except FileExistsError as exc:
+            send_frame(connection, ResponseFrame.error_response(request_id, "file_exists", str(exc)))
+        except ValueError as exc:
             send_frame(connection, ResponseFrame.error_response(request_id, "invalid_request", str(exc)))
         except (EOFError, OSError):
             pass
@@ -204,10 +214,17 @@ class ServiceServer:
             return {"task_ids": self.manager.pause_all()}
         if action == "resume":
             return {"task": self.manager.resume(str(payload["task_id"])).to_dict()}
+        if action == "resume_all":
+            return {"task_ids": self.manager.resume_all()}
         if action == "cancel":
             return {"task": self.manager.cancel(str(payload["task_id"])).to_dict()}
         if action == "retry":
             return {"task": self.manager.retry(str(payload["task_id"])).to_dict()}
+        if action == "delete_task":
+            delete_files = payload.get("delete_files", False)
+            if not isinstance(delete_files, bool):
+                raise ValueError("delete_files 必须是布尔值")
+            return self.manager.delete(str(payload["task_id"]), delete_files=delete_files)
         if action == "get_settings":
             return {"settings": asdict(self.manager.get_settings())}
         if action == "update_settings":

@@ -22,8 +22,10 @@ class Subscription:
 class StaticClient:
     def __init__(self, tasks: list[dict] | None = None) -> None:
         self.tasks = list(tasks or [])
+        self.calls: list[tuple[str, dict]] = []
 
     def request(self, action, payload, request_id=None):
+        self.calls.append((action, payload))
         if action == "list":
             return {"tasks": self.tasks}
         if action == "get_settings":
@@ -63,6 +65,7 @@ def six_tasks() -> list[dict]:
                 "completed": completed,
                 "total": total,
                 "speed_bps": speed,
+                "eta_seconds": 95.0 if index == 1 else None,
                 "route": route,
                 "error": error,
                 "final_path": f"/tmp/层级很深的输出目录/节目归档/2026/十月/{name}.mp4",
@@ -72,6 +75,8 @@ def six_tasks() -> list[dict]:
                     else f"https://cdn.example.com/{index}.m3u8"
                 ),
                 "save_root": "/tmp/层级很深的输出目录/节目归档/2026/十月",
+                "auto_retry_count": 2 if index == 5 else 0,
+                "next_retry_at": "2026-11-06T13:00:00+00:00" if index == 5 else None,
                 "url": (
                     "https://real-user:real-password@cdn.example.com/video.m3u8?token=real-token#private"
                     if index == 3

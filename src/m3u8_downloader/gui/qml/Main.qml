@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Dialogs
 import QtQuick.Layouts
 import "components"
 import "pages"
@@ -21,6 +20,7 @@ ApplicationWindow {
     property bool trayAvailable: false
     property string errorMessage: ""
     property var pendingTask: ({})
+    property var pendingDeleteTask: ({})
     readonly property bool compactLayout: width < 1100
     readonly property bool horizontalOverflow: urlInput.x < 0
         || batchAddButton.x + batchAddButton.width > composer.width
@@ -28,6 +28,11 @@ ApplicationWindow {
     Action { id: pauseAllAction; objectName: "pauseAllAction"; text: "暂停全部"; onTriggered: bridge.pauseAll() }
     Action { id: showWindowAction; objectName: "showWindowAction"; text: "显示主窗口"; onTriggered: window.show() }
     Action { id: quitAction; objectName: "quitAction"; text: "退出"; onTriggered: Qt.quit() }
+
+    function requestTaskDeletion(taskId, taskName, finalPath) {
+        pendingDeleteTask = {"taskId": taskId, "taskName": taskName, "finalPath": finalPath}
+        deleteTaskDialog.open()
+    }
 
     Rectangle {
         id: sidebar
@@ -85,7 +90,7 @@ ApplicationWindow {
         anchors.left: sidebar.right
         anchors.right: parent.right
         anchors.top: parent.top
-        height: window.compactLayout ? 246 : 176
+        height: window.compactLayout ? 204 : 176
         color: "#101a24"
 
         readonly property real marginLeft: window.compactLayout ? 18 : 24
@@ -93,11 +98,10 @@ ApplicationWindow {
         readonly property real gap: 14
         readonly property real availableWidth: width - marginLeft - marginRight
         readonly property real desktopNameWidth: 260
-        readonly property real desktopSaveWidth: 225
         readonly property real compactFirstWidth: (availableWidth - gap) * 0.6
         readonly property real compactSecondWidth: availableWidth - gap - compactFirstWidth
-        readonly property real desktopUrlWidth: availableWidth - desktopNameWidth - desktopSaveWidth
-            - addTaskButton.width - batchAddButton.width - gap * 4
+        readonly property real desktopUrlWidth: availableWidth - desktopNameWidth
+            - addTaskButton.width - batchAddButton.width - gap * 3
 
         Text {
             id: urlLabel
@@ -133,8 +137,10 @@ ApplicationWindow {
             x: taskNameLabel.x
             y: urlInput.y
             width: window.compactLayout ? composer.compactSecondWidth : composer.desktopNameWidth
-            text: "风起长安 第03集"
-            KeyNavigation.tab: saveInput
+            text: ""
+            placeholderText: "例如：风起长安 第03集"
+            KeyNavigation.tab: addTaskButton
+            KeyNavigation.backtab: urlInput
         }
         Text {
             id: outputPreview
@@ -149,70 +155,30 @@ ApplicationWindow {
             elide: Text.ElideMiddle
         }
 
-        Text {
-            id: saveToLabel
-            objectName: "saveToLabel"
-            x: window.compactLayout ? composer.marginLeft : taskNameInput.x + taskNameInput.width + composer.gap
-            y: window.compactLayout ? 132 : urlLabel.y
-            text: "保存到"
-            color: AppTheme.Theme.muted
-            font.pixelSize: AppTheme.Theme.labelSize
-        }
-        StyledTextField {
-            id: saveInput
-            objectName: "saveInput"
-            x: saveToLabel.x
-            y: window.compactLayout ? 158 : urlInput.y
-            width: window.compactLayout
-                ? composer.availableWidth - addTaskButton.width - batchAddButton.width - composer.gap * 2
-                : composer.desktopSaveWidth
-            text: bridge.defaultSaveDir
-            trailingIcon: "folder"
-            trailingTabTarget: addTaskButton
-            KeyNavigation.tab: trailingAction
-            onTrailingClicked: folderDialog.open()
-        }
         PrimaryButton {
             id: addTaskButton
             objectName: "addTaskButton"
-            x: saveInput.x + saveInput.width + composer.gap
-            y: saveInput.y
+            x: window.compactLayout
+                ? composer.marginLeft
+                : taskNameInput.x + taskNameInput.width + composer.gap
+            y: window.compactLayout ? 132 : urlInput.y
             text: "添加任务"
             KeyNavigation.tab: batchAddButton
+            KeyNavigation.backtab: taskNameInput
             onClicked: {
-                window.pendingTask = {"url": urlInput.text, "task_name": taskNameInput.text, "save_root": saveInput.text}
-                bridge.submitTask(urlInput.text, taskNameInput.text, saveInput.text, overwriteCheck.checked)
+                bridge.submitTask(urlInput.text, taskNameInput.text)
             }
         }
         SecondaryButton {
             id: batchAddButton
             objectName: "batchAddButton"
             x: addTaskButton.x + addTaskButton.width + composer.gap
-            y: saveInput.y
+            y: addTaskButton.y
             text: "批量添加"
-            KeyNavigation.tab: overwriteCheck
+            KeyNavigation.tab: downloadsNavigation
+            KeyNavigation.backtab: addTaskButton
             onClicked: batchDialog.open()
         }
-        StyledCheckBox {
-            id: overwriteCheck
-            objectName: "overwriteCheck"
-            text: "允许覆盖已存在文件"
-            x: addTaskButton.x
-            y: window.compactLayout ? 213 : 120
-            width: addTaskButton.width + composer.gap + batchAddButton.width
-            height: 24
-            checked: false
-            visible: true
-            KeyNavigation.tab: downloadsNavigation
-            KeyNavigation.backtab: batchAddButton
-        }
-    }
-
-    FolderDialog {
-        id: folderDialog
-        objectName: "saveFolderDialog"
-        title: "选择保存目录"
-        onAccepted: saveInput.text = bridge.localPathFromUrl(selectedFolder)
     }
 
     DownloadsPage {
@@ -224,12 +190,19 @@ ApplicationWindow {
         anchors.bottom: parent.bottom
         visible: window.currentPage === 0
         taskModel: bridge.tasks
+        onDeleteRequested: function(taskId, taskName, finalPath) {
+            window.requestTaskDeletion(taskId, taskName, finalPath)
+        }
     }
     CompletedPage {
+        id: completed
         objectName: "completedPage"
         anchors.fill: downloads
         visible: window.currentPage === 1
         taskModel: bridge.tasks
+        onDeleteRequested: function(taskId, taskName, finalPath) {
+            window.requestTaskDeletion(taskId, taskName, finalPath)
+        }
     }
     SettingsPage {
         objectName: "settingsPage"
@@ -239,8 +212,6 @@ ApplicationWindow {
     BatchDialog {
         id: batchDialog
         objectName: "batchDialog"
-        saveRoot: saveInput.text
-        overwrite: overwriteCheck.checked
     }
 
     Dialog {
@@ -275,11 +246,72 @@ ApplicationWindow {
         footer: DialogButtonBox {
             Button { text: "返回修改"; DialogButtonBox.buttonRole: DialogButtonBox.RejectRole }
             Button {
+                objectName: "confirmOverwriteButton"
                 text: "覆盖"
                 DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
                 onClicked: {
                     overwriteConflictDialog.close()
-                    bridge.submitTask(window.pendingTask.url, window.pendingTask.task_name, window.pendingTask.save_root, true)
+                    bridge.submitTaskWithOverwrite(
+                        window.pendingTask.url,
+                        window.pendingTask.task_name,
+                        window.pendingTask.save_root
+                    )
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: deleteTaskDialog
+        objectName: "deleteTaskDialog"
+        title: "删除任务"
+        modal: true
+        width: Math.min(window.width - 48, 560)
+        anchors.centerIn: parent
+        onOpened: deleteRecordOnlyButton.forceActiveFocus()
+        contentItem: ColumnLayout {
+            spacing: 10
+            Label {
+                id: deleteTaskMessage
+                objectName: "deleteTaskMessage"
+                Layout.fillWidth: true
+                text: "确认删除任务“" + (window.pendingDeleteTask.taskName || "") + "”？"
+                color: AppTheme.Theme.text
+                font.pixelSize: 15
+                wrapMode: Text.Wrap
+            }
+            Label {
+                Layout.fillWidth: true
+                text: "仅删除记录不会触碰本地文件。删除记录和本地文件会清理任务分片；仅当任务已完成且输出路径未被其他记录引用时，才会同时删除以下视频文件：\n"
+                    + (window.pendingDeleteTask.finalPath || "")
+                color: AppTheme.Theme.muted
+                font.pixelSize: 13
+                wrapMode: Text.Wrap
+            }
+        }
+        footer: DialogButtonBox {
+            Button {
+                objectName: "deleteCancelButton"
+                text: "取消"
+                DialogButtonBox.buttonRole: DialogButtonBox.RejectRole
+            }
+            Button {
+                id: deleteRecordOnlyButton
+                objectName: "deleteRecordOnlyButton"
+                text: "仅删除记录"
+                DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
+                onClicked: {
+                    deleteTaskDialog.close()
+                    bridge.deleteTask(window.pendingDeleteTask.taskId || "", false)
+                }
+            }
+            Button {
+                objectName: "deleteRecordAndFilesButton"
+                text: "删除记录和本地文件"
+                DialogButtonBox.buttonRole: DialogButtonBox.DestructiveRole
+                onClicked: {
+                    deleteTaskDialog.close()
+                    bridge.deleteTask(window.pendingDeleteTask.taskId || "", true)
                 }
             }
         }
@@ -289,15 +321,22 @@ ApplicationWindow {
         target: bridge
         function onRequestFailed(action, message) {
             window.errorMessage = message
-            if (action === "submit" && (message.indexOf("已存在") >= 0 || message.indexOf("占用") >= 0))
-                overwriteConflictDialog.open()
-            else
+            if (action !== "submit")
                 errorDialog.open()
+        }
+        function onRequestFailedDetailed(action, code, message, context) {
+            window.errorMessage = message
+            if (action === "submit" && code === "file_exists" && context && context.overwrite === false) {
+                window.pendingTask = context
+                overwriteConflictDialog.open()
+            } else {
+                errorDialog.open()
+            }
         }
         function onRequestSucceeded(action, result) {
             if (action === "submit") {
                 urlInput.text = ""
-                overwriteCheck.checked = false
+                taskNameInput.text = ""
             } else if (action === "submit_batch") {
                 batchDialog.close()
             }

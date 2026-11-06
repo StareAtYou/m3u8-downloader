@@ -17,6 +17,12 @@ def test_manual_proxy_policy_requires_a_local_proxy_url() -> None:
         AppSettings(proxy_policy="manual").validate()
 
 
+def test_overwrite_setting_requires_a_real_boolean() -> None:
+    assert AppSettings(overwrite_existing=True).validate().overwrite_existing is True
+    with pytest.raises(ValueError, match="覆盖"):
+        AppSettings(overwrite_existing=1).validate()
+
+
 def make_task() -> TaskRecord:
     return TaskRecord.new(
         task_id="task-1",
@@ -48,12 +54,23 @@ def test_rejects_completed_restart_and_merging_pause() -> None:
 
 
 def test_public_snapshot_redacts_signed_url() -> None:
-    task = replace(make_task(), state=TaskState.DOWNLOADING, completed=2, total=10)
+    task = replace(
+        make_task(),
+        state=TaskState.DOWNLOADING,
+        completed=2,
+        total=10,
+        auto_retry_count=2,
+        next_retry_at="2026-11-06T13:00:00+00:00",
+        eta_seconds=45.5,
+    )
 
     snapshot = task.to_snapshot()
 
     assert task.url.endswith("token=secret&expires=123")
     assert snapshot.redacted_url == "https://media.example/video.m3u8?token=%2A%2A%2A&expires=%2A%2A%2A"
+    assert snapshot.to_dict()["auto_retry_count"] == 2
+    assert snapshot.to_dict()["next_retry_at"] == "2026-11-06T13:00:00+00:00"
+    assert snapshot.to_dict()["eta_seconds"] == 45.5
     assert "secret" not in snapshot.to_dict().values()
 
 

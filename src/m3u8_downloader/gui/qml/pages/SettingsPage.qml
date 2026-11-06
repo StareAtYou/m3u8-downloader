@@ -52,10 +52,23 @@ Rectangle {
                 objectName: "defaultSaveDir"
                 Layout.fillWidth: true
                 text: bridge.defaultSaveDir
-                KeyNavigation.tab: closeBehavior
+                KeyNavigation.tab: overwriteExistingCheck
                 KeyNavigation.backtab: saveSettingsButton
                 KeyNavigation.priority: KeyNavigation.BeforeItem
                 onActiveFocusChanged: if (activeFocus) settingsScroll.reveal(defaultSaveDir)
+            }
+
+            StyledCheckBox {
+                id: overwriteExistingCheck
+                objectName: "overwriteExistingCheck"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 28
+                text: "允许覆盖已存在文件"
+                checked: bridge.overwriteExisting
+                KeyNavigation.tab: closeBehavior
+                KeyNavigation.backtab: defaultSaveDir
+                KeyNavigation.priority: KeyNavigation.BeforeItem
+                onActiveFocusChanged: if (activeFocus) settingsScroll.reveal(overwriteExistingCheck)
             }
 
             Text { objectName: "closeBehaviorLabel"; text: "关闭窗口时"; color: AppTheme.Theme.muted; font.pixelSize: AppTheme.Theme.bodySize; Layout.topMargin: 4 }
@@ -65,7 +78,7 @@ Rectangle {
                 Layout.fillWidth: true
                 model: ["最小化到系统托盘", "退出界面"]
                 KeyNavigation.tab: activeTasks
-                KeyNavigation.backtab: defaultSaveDir
+                KeyNavigation.backtab: overwriteExistingCheck
                 KeyNavigation.priority: KeyNavigation.BeforeItem
                 onActiveFocusChanged: if (activeFocus) settingsScroll.reveal(closeBehavior)
             }
@@ -173,6 +186,7 @@ Rectangle {
                     "proxy_policy": proxyPolicy.currentIndex === 0 ? "auto" : proxyPolicy.currentIndex === 1 ? "direct" : "manual",
                     "manual_proxy": manualProxy.text || null,
                     "ffmpeg_path": ffmpegPath.text || "ffmpeg",
+                    "overwrite_existing": overwriteExistingCheck.checked,
                     "close_behavior": closeBehavior.currentIndex === 0 ? "tray" : "shutdown"
                 })
             }
@@ -188,6 +202,7 @@ Rectangle {
             proxyPolicy.currentIndex = settings.proxy_policy === "direct" ? 1 : settings.proxy_policy === "manual" ? 2 : 0
             manualProxy.text = settings.manual_proxy || ""
             ffmpegPath.text = settings.ffmpeg_path || "ffmpeg"
+            overwriteExistingCheck.checked = settings.overwrite_existing === true
             closeBehavior.currentIndex = settings.close_behavior === "shutdown" ? 1 : 0
         }
     }

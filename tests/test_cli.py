@@ -12,6 +12,7 @@ from m3u8_downloader import cli
 from m3u8_downloader.cli import client_main, connect_or_start, service_command
 from m3u8_downloader.config import AppPaths
 from m3u8_downloader.ipc_client import ServiceError
+from m3u8_downloader.models import AppSettings
 from m3u8_downloader.terminal_view import render_tasks
 
 
@@ -145,11 +146,14 @@ def test_service_keeps_instance_ownership_until_workers_and_repository_stop(
         def __init__(self, path: Path) -> None:
             pass
 
+        def get_settings(self) -> AppSettings:
+            return AppSettings()
+
         def close(self) -> None:
             lifecycle.append("repository")
 
     class Manager:
-        def __init__(self, repository: Repository, workspace: Path) -> None:
+        def __init__(self, repository: Repository, workspace: Path, *, settings_store=None) -> None:
             self.lock: Lock | None = None
 
         def shutdown(self, *, timeout: float = 5.0) -> None:

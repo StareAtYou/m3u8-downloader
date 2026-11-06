@@ -64,10 +64,15 @@ class AppSettings:
     ffmpeg_path: str = "ffmpeg"
     theme: str = "dark"
     close_behavior: str = "tray"
+    overwrite_existing: bool = False
 
     def validate(self) -> AppSettings:
+        if type(self.max_active_tasks) is not int:
+            raise ValueError("同时下载任务数必须是整数")
         if not 1 <= self.max_active_tasks <= 16:
             raise ValueError("同时下载任务数必须在 1 到 16 之间")
+        if type(self.segment_threads) is not int:
+            raise ValueError("分片线程数必须是整数")
         if not 1 <= self.segment_threads <= 64:
             raise ValueError("分片线程数必须在 1 到 64 之间")
         if self.proxy_policy not in {"auto", "direct", "manual"}:
@@ -82,6 +87,8 @@ class AppSettings:
             raise ValueError("无效的界面主题")
         if self.close_behavior not in {"tray", "shutdown"}:
             raise ValueError("无效的关闭行为")
+        if type(self.overwrite_existing) is not bool:
+            raise ValueError("允许覆盖已存在文件必须是布尔值")
         return self
 
 
@@ -104,6 +111,9 @@ class TaskSnapshot:
     created_at: str
     updated_at: str
     pause_requested: bool
+    auto_retry_count: int = 0
+    next_retry_at: str | None = None
+    eta_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -141,6 +151,9 @@ class TaskRecord:
     created_at: str = ""
     updated_at: str = ""
     pause_requested: bool = False
+    auto_retry_count: int = 0
+    next_retry_at: str | None = None
+    eta_seconds: float | None = None
 
     @classmethod
     def new(cls, **values: Any) -> TaskRecord:
@@ -166,6 +179,9 @@ class TaskRecord:
             created_at=self.created_at,
             updated_at=self.updated_at,
             pause_requested=self.pause_requested,
+            auto_retry_count=self.auto_retry_count,
+            next_retry_at=self.next_retry_at,
+            eta_seconds=self.eta_seconds,
         )
 
     def event(self, state: TaskState, payload: Mapping[str, Any] | None = None) -> TaskEvent:
