@@ -402,7 +402,9 @@ def test_task_table_has_complete_columns_fixed_geometry_and_placeholders(qtbot) 
     assert len(rows) == 6
     assert {row.property("height") for row in rows} == {66.0}
     assert visual_named(viewport, "firstSpecification").property("text") == "—"
-    assert visual_named(viewport, "firstEta").property("text") == "—"
+    assert visual_named(viewport, "firstEta").property("text") == "约 2 分钟"
+    assert visual_named(rows[2], "rowEta").property("text") == "—"
+    assert visual_named(rows[4], "stateBadge").property("label") == "等待重试 2/3"
     bridge.close()
     del engine
 

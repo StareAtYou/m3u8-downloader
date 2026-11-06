@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import math
+
+import pytest
 from PySide6.QtCore import Qt
 
 from m3u8_downloader.gui.task_list_model import TaskListModel
 
 
-def task(task_id: str, state: str = "downloading", completed: int = 2) -> dict:
+def task(
+    task_id: str,
+    state: str = "downloading",
+    completed: int = 2,
+    *,
+    eta_seconds: object = 45,
+    auto_retry_count: int = 0,
+    next_retry_at: str | None = None,
+) -> dict:
     return {
         "task_id": task_id,
         "task_name": f"Task {task_id}",
@@ -14,6 +25,7 @@ def task(task_id: str, state: str = "downloading", completed: int = 2) -> dict:
         "completed": completed,
         "total": 10,
         "speed_bps": 1024,
+        "eta_seconds": eta_seconds,
         "route": "直连",
         "error": None,
         "final_path": f"/tmp/{task_id}.mp4",
@@ -21,6 +33,8 @@ def task(task_id: str, state: str = "downloading", completed: int = 2) -> dict:
         "save_root": "/tmp/下载目录",
         "url": "https://user:password@example/media.m3u8?token=real-secret#private",
         "pause_requested": False,
+        "auto_retry_count": auto_retry_count,
+        "next_retry_at": next_retry_at,
     }
 
 
@@ -41,6 +55,7 @@ def test_snapshot_roles_are_display_safe_and_complete(qtbot) -> None:
         "stateLabel",
         "progress",
         "speedText",
+        "etaText",
         "route",
         "errorText",
         "canPause",
@@ -53,11 +68,56 @@ def test_snapshot_roles_are_display_safe_and_complete(qtbot) -> None:
     index = model.index(0, 0)
     assert model.data(index, names["taskId"]) == "1"
     assert model.data(index, names["progress"]) == 0.2
+    assert model.data(index, names["etaText"]) == "约 45 秒"
     assert model.get(0)["taskName"] == "Task 1"
     assert model.get(0)["taskState"] == "downloading"
     assert model.get(99) == {}
     assert "real-secret" not in repr(model.item(0))
     assert model.data(index, Qt.DisplayRole) == "Task 1"
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (45, "约 45 秒"),
+        (180, "约 3 分钟"),
+        (7200, "约 2 小时"),
+        (7500, "约 2 小时 5 分钟"),
+    ],
+)
+def test_eta_text_formats_download_estimates(seconds: float, expected: str) -> None:
+    model = TaskListModel()
+    model.replace([task("1", eta_seconds=seconds)])
+
+    assert model.get(0)["etaText"] == expected
+
+
+@pytest.mark.parametrize("value", [None, -1, math.nan, math.inf, "soon", True])
+def test_eta_text_rejects_unreliable_values(value: object) -> None:
+    model = TaskListModel()
+    model.replace([task("1", eta_seconds=value)])
+    assert model.get(0)["etaText"] == "—"
+
+    model.replace([task("1", state="paused", eta_seconds=45)])
+    assert model.get(0)["etaText"] == "—"
+
+
+def test_retry_wait_state_label_uses_persisted_attempt_count() -> None:
+    model = TaskListModel()
+    model.replace(
+        [
+            task(
+                "waiting",
+                state="failed",
+                auto_retry_count=2,
+                next_retry_at="2026-11-06T13:00:00+00:00",
+            ),
+            task("exhausted", state="failed", auto_retry_count=3),
+        ]
+    )
+
+    assert model.get(0)["stateLabel"] == "等待重试 2/3"
+    assert model.get(1)["stateLabel"] == "失败"
 
 
 def test_replace_inserts_updates_moves_and_removes_by_task_id(qtbot) -> None:
@@ -208,6 +268,7 @@ def test_full_url_fields_never_enter_presentation_roles(qtbot) -> None:
         "completed",
         "total",
         "speedText",
+        "etaText",
         "route",
         "errorText",
         "finalPath",

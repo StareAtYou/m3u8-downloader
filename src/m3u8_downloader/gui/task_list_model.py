@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from enum import IntEnum
 from typing import Any
 
@@ -29,6 +30,7 @@ class TaskRole(IntEnum):
     REDACTED_URL = Qt.UserRole + 18
     SAVE_ROOT = Qt.UserRole + 19
     CAN_DELETE = Qt.UserRole + 20
+    ETA_TEXT = Qt.UserRole + 21
 
 
 ROLE_NAMES = {
@@ -52,6 +54,7 @@ ROLE_NAMES = {
     TaskRole.REDACTED_URL: b"redactedUrl",
     TaskRole.SAVE_ROOT: b"saveRoot",
     TaskRole.CAN_DELETE: b"canDelete",
+    TaskRole.ETA_TEXT: b"etaText",
 }
 
 _SAFE_FIELDS = {
@@ -68,6 +71,9 @@ _SAFE_FIELDS = {
     "redacted_url",
     "save_root",
     "pause_requested",
+    "auto_retry_count",
+    "next_retry_at",
+    "eta_seconds",
 }
 
 _ROOT_INDEX = QModelIndex()
@@ -81,6 +87,23 @@ def _speed(value: float) -> str:
     if value < 1024**2:
         return f"{value / 1024:.1f} KB/s"
     return f"{value / 1024**2:.1f} MB/s"
+
+
+def _eta_text(state: str, value: object) -> str:
+    if state != "downloading" or type(value) not in {int, float}:
+        return "—"
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        return "—"
+    if seconds < 60:
+        return f"约 {math.ceil(seconds)} 秒"
+    total_minutes = math.ceil(seconds / 60)
+    if total_minutes < 60:
+        return f"约 {total_minutes} 分钟"
+    hours, minutes = divmod(total_minutes, 60)
+    if minutes == 0:
+        return f"约 {hours} 小时"
+    return f"约 {hours} 小时 {minutes} 分钟"
 
 
 class TaskListModel(QAbstractListModel):
@@ -135,16 +158,21 @@ class TaskListModel(QAbstractListModel):
         if role == Qt.DisplayRole:
             return item.get("task_name", "")
         state = str(item.get("state", ""))
+        state_label = STATE_LABELS.get(state, state)
+        retry_count = item.get("auto_retry_count", 0)
+        if state == "failed" and item.get("next_retry_at") and type(retry_count) is int and retry_count > 0:
+            state_label = f"等待重试 {retry_count}/3"
         values = {
             TaskRole.TASK_ID: item.get("task_id", ""),
             TaskRole.TASK_NAME: item.get("task_name", ""),
             TaskRole.FILENAME: item.get("filename", ""),
             TaskRole.STATE: state,
-            TaskRole.STATE_LABEL: STATE_LABELS.get(state, state),
+            TaskRole.STATE_LABEL: state_label,
             TaskRole.PROGRESS: min(1.0, int(item.get("completed", 0)) / max(1, int(item.get("total", 0)))),
             TaskRole.COMPLETED: int(item.get("completed", 0)),
             TaskRole.TOTAL: int(item.get("total", 0)),
             TaskRole.SPEED_TEXT: _speed(float(item.get("speed_bps", 0) or 0)),
+            TaskRole.ETA_TEXT: _eta_text(state, item.get("eta_seconds")),
             TaskRole.ROUTE: item.get("route") or "检测中",
             TaskRole.ERROR_TEXT: item.get("error") or "",
             TaskRole.FINAL_PATH: item.get("final_path") or "",

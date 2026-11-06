@@ -186,6 +186,7 @@ Rectangle {
                     required property int completed
                     required property int total
                     required property string speedText
+                    required property string etaText
                     required property string route
                     required property string finalPath
                     required property bool canPause
@@ -279,7 +280,7 @@ Rectangle {
                         Text { objectName: "rowSpeedColumn"; text: row.speedText; color: AppTheme.Theme.text; font.pixelSize: 13; Layout.preferredWidth: page.speedWidth; Layout.minimumWidth: page.speedWidth; Layout.maximumWidth: page.speedWidth; visible: page.showSpeed }
                         Text {
                             objectName: row.index === 0 ? "firstEta" : "rowEta"
-                            text: "—"
+                            text: row.etaText
                             color: AppTheme.Theme.muted
                             font.pixelSize: 13
                             Layout.preferredWidth: page.etaWidth
